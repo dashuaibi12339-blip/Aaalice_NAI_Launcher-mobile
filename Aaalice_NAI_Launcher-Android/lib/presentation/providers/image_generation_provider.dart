@@ -1,0 +1,1861 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:math';
+import 'dart:typed_data';
+
+import 'package:dio/dio.dart';
+import 'package:image/image.dart' as img;
+import 'package:path/path.dart' as p;
+import 'package:riverpod_annotation/riverpod_annotation.dart';
+
+import '../../core/utils/app_logger.dart';
+import '../../core/utils/image_save_utils.dart';
+import '../../core/utils/image_share_sanitizer.dart';
+import '../../core/utils/nai_prompt_formatter.dart';
+import '../../core/utils/prompt_preset_resolution.dart';
+import '../../data/services/image_metadata_service.dart';
+import '../../data/datasources/remote/nai_image_generation_api_service.dart';
+import '../../data/models/character/character_prompt.dart' as ui_character;
+import '../../data/models/fixed_tag/fixed_tag_entry.dart';
+import '../../data/models/gallery/nai_image_metadata.dart';
+import '../../data/models/image/image_params.dart';
+import '../../data/repositories/gallery_folder_repository.dart';
+import '../../data/services/statistics_cache_service.dart';
+import '../../data/services/alias_resolver_service.dart';
+import 'character_prompt_provider.dart';
+import 'fixed_tags_provider.dart';
+import 'image_save_settings_provider.dart';
+import 'local_gallery_provider.dart';
+import 'prompt_config_provider.dart';
+import 'quality_preset_provider.dart';
+import 'queue_execution_provider.dart';
+import 'subscription_provider.dart';
+import 'uc_preset_provider.dart';
+
+import 'generation/generation_models.dart';
+import 'generation/generation_params_notifier.dart';
+import 'generation/generation_settings_notifiers.dart';
+import 'generation/image_workflow_controller.dart';
+
+export 'generation/generation_models.dart';
+export 'generation/generation_params_notifier.dart';
+export 'generation/generation_auxiliary_notifiers.dart';
+export 'generation/generation_settings_notifiers.dart';
+export 'generation/reference_panel_notifier.dart';
+
+// Simplified ImageGenerationProvider - new exports
+export 'generation/image_generation_service.dart';
+export 'generation/batch_generation_notifier.dart';
+export 'generation/stream_generation_notifier.dart';
+export 'generation/metadata_preload_notifier.dart';
+export 'generation/retry_policy_notifier.dart';
+
+part 'image_generation_provider.g.dart';
+
+/// 并发流式预览图独立存储 Provider (完美兼容新版 Riverpod)
+final streamPreviewsProvider = NotifierProvider<StreamPreviewsNotifier, Map<int, Uint8List>>(StreamPreviewsNotifier.new);
+
+class StreamPreviewsNotifier extends Notifier<Map<int, Uint8List>> {
+  @override
+  Map<int, Uint8List> build() => {};
+  
+  void updatePreview(int index, Uint8List bytes) {
+    state = {...state, index: bytes};
+  }
+  
+  void clear() {
+    state = {};
+  }
+}
+
+/// 图像生成状态 Notifier
+@Riverpod(keepAlive: true)
+class ImageGenerationNotifier extends _$ImageGenerationNotifier {
+  @override
+  ImageGenerationState build() {
+    return const ImageGenerationState();
+  }
+
+  void _retainSharePreparationCacheForCurrentHistory() {
+    final retainedImageIds = <String>{
+      for (final image in state.currentImages) image.id,
+      for (final image in state.history) image.id,
+    };
+    unawaited(
+      ShareImagePreparationService.instance.retainHistoryImageIds(
+        retainedImageIds,
+      ),
+    );
+  }
+
+  /// 生成图像
+  /// 重试延迟策略 (毫秒)
+  static const List<int> _retryDelays = [1000, 2000, 4000];
+  static const int _maxRetries = 3;
+  static const int _randomSeedExclusiveUpperBound = 4294967295;
+
+  bool _isCancelled = false;
+  int _generationRunCounter = 0;
+  int _activeGenerationRunId = 0;
+  Uint8List? _lastStreamPreviewBytes;
+  ImageParams? _lastStreamPreviewParams;
+  String? _lastStreamPreviewSnapshotKey;
+  final Set<String> _failedStreamSnapshotKeys = <String>{};
+
+  int _startGenerationRun() {
+    ref.read(streamPreviewsProvider.notifier).clear(); // 👈 修改这里
+    _isCancelled = false;    
+    _activeGenerationRunId = ++_generationRunCounter;
+    _lastStreamPreviewBytes = null;
+    _lastStreamPreviewParams = null;
+    _lastStreamPreviewSnapshotKey = null;
+    _failedStreamSnapshotKeys.clear();
+    return _activeGenerationRunId;
+  }
+
+  void _invalidateGenerationRun() {
+    _isCancelled = true;
+    _activeGenerationRunId = ++_generationRunCounter;
+  }
+
+  bool _isCurrentGenerationRun(int generationRunId) =>
+      generationRunId == _activeGenerationRunId;
+
+  bool _shouldAbortGenerationRun(int generationRunId) =>
+      _isCancelled || !_isCurrentGenerationRun(generationRunId);
+
+  ImageParams _materializeRandomSeed(ImageParams params) {
+    if (params.seed != -1) return params;
+
+    return params.copyWith(
+      seed: Random().nextInt(_randomSeedExclusiveUpperBound),
+    );
+  }
+
+  String _streamSnapshotKey(int generationRunId, int imageNumber) =>
+      '$generationRunId:$imageNumber';
+
+  void _rememberStreamPreview({
+    required Uint8List bytes,
+    required ImageParams params,
+    required int generationRunId,
+    required int imageNumber,
+  }) {
+    if (_shouldAbortGenerationRun(generationRunId) || bytes.isEmpty) {
+      return;
+    }
+
+    _lastStreamPreviewBytes = Uint8List.fromList(bytes);
+    _lastStreamPreviewParams = params;
+    _lastStreamPreviewSnapshotKey =
+        _streamSnapshotKey(generationRunId, imageNumber);
+  }
+
+  void _clearRememberedStreamPreview({
+    int? generationRunId,
+    int? imageNumber,
+  }) {
+    if (generationRunId != null && imageNumber != null) {
+      final key = _streamSnapshotKey(generationRunId, imageNumber);
+      if (_lastStreamPreviewSnapshotKey != key) return;
+    }
+
+    _lastStreamPreviewBytes = null;
+    _lastStreamPreviewParams = null;
+    _lastStreamPreviewSnapshotKey = null;
+  }
+
+  bool _appendFailedStreamSnapshotToHistory({
+    required int generationRunId,
+    required int imageNumber,
+  }) {
+    if (!_isCurrentGenerationRun(generationRunId)) return false;
+
+    final key = _streamSnapshotKey(generationRunId, imageNumber);
+    if (_lastStreamPreviewSnapshotKey != key) return false;
+
+    final previewBytes = _lastStreamPreviewBytes;
+    final params = _lastStreamPreviewParams;
+    if (previewBytes == null || previewBytes.isEmpty || params == null) {
+      return false;
+    }
+    if (!_failedStreamSnapshotKeys.add(key)) return false;
+
+    final resolvedSize = _resolveImageSize(
+          previewBytes,
+          width: params.width,
+          height: params.height,
+        ) ??
+        (params.width, params.height);
+    final snapshot = GeneratedImage.create(
+      previewBytes,
+      width: resolvedSize.$1,
+      height: resolvedSize.$2,
+      kind: GeneratedImageKind.failedStreamSnapshot,
+      metadata: _metadataFromParams(params),
+    );
+
+    state = state.copyWith(
+      history: [snapshot, ...state.history].take(50).toList(),
+      clearStreamPreview: true,
+    );
+    _retainSharePreparationCacheForCurrentHistory();
+    _clearRememberedStreamPreview(
+      generationRunId: generationRunId,
+      imageNumber: imageNumber,
+    );
+    return true;
+  }
+
+  NaiImageMetadata _metadataFromParams(ImageParams params) {
+    final (charCaptions, charNegCaptions) = _buildCharacterCaptions(params);
+    final commentJson = ImageSaveUtils.buildCommentJson(
+      params: params,
+      actualSeed: params.seed,
+      charCaptions: charCaptions,
+      charNegCaptions: charNegCaptions,
+      useCoords: params.useCoords,
+    );
+    final rawJson = jsonEncode(commentJson);
+    return NaiImageMetadata.fromNaiComment(
+      {
+        'Comment': rawJson,
+        'Software': 'NovelAI',
+        'Source': _modelSourceName(params.model),
+      },
+      rawJson: rawJson,
+    );
+  }
+
+  (
+    List<Map<String, dynamic>> charCaptions,
+    List<Map<String, dynamic>> charNegCaptions,
+  ) _buildCharacterCaptions(ImageParams params) {
+    final charCaptions = <Map<String, dynamic>>[];
+    final charNegCaptions = <Map<String, dynamic>>[];
+
+    for (final char in params.characters) {
+      charCaptions.add({
+        'char_caption': char.prompt,
+        'centers': [
+          {'x': 0.5, 'y': 0.5},
+        ],
+      });
+      charNegCaptions.add({
+        'char_caption': char.negativePrompt,
+        'centers': [
+          {'x': 0.5, 'y': 0.5},
+        ],
+      });
+    }
+
+    return (charCaptions, charNegCaptions);
+  }
+
+  String _modelSourceName(String model) {
+    if (model.contains('diffusion-4-5')) {
+      if (model.contains('curated')) {
+        return 'NovelAI Diffusion V4.5 Curated';
+      }
+      return 'NovelAI Diffusion V4.5 Full';
+    }
+    if (model.contains('diffusion-4')) {
+      if (model.contains('curated')) {
+        return 'NovelAI Diffusion V4 Curated';
+      }
+      return 'NovelAI Diffusion V4 Full';
+    }
+    if (model.contains('furry') && model.contains('-3')) {
+      return 'NovelAI Furry Diffusion V3';
+    }
+    if (model.contains('diffusion-3')) {
+      return 'NovelAI Diffusion V3';
+    }
+    if (model.contains('diffusion-2')) {
+      return 'NovelAI Diffusion V2';
+    }
+    if (model.contains('furry')) {
+      return 'NovelAI Furry Diffusion';
+    }
+    return 'NovelAI';
+  }
+
+  Future<ImageParams> _prepareVibesForGeneration(ImageParams params) async {
+    if (params.vibeReferencesV4.isEmpty) {
+      return params;
+    }
+
+    final notifier = ref.read(generationParamsNotifierProvider.notifier);
+    final encodedVibes = await notifier.ensureVibeReferencesEncoded(
+      params.vibeReferencesV4,
+      model: params.model,
+      syncCurrentState: true,
+    );
+
+    if (identical(encodedVibes, params.vibeReferencesV4)) {
+      return params;
+    }
+
+    return params.copyWith(vibeReferencesV4: encodedVibes);
+  }
+
+  PromptPresetResolution _resolvePromptPresets(ImageParams params) {
+    final qualityState = ref.read(qualityPresetNotifierProvider);
+    final qualityContent = ref
+        .read(qualityPresetNotifierProvider.notifier)
+        .getEffectiveContent(params.model);
+    final ucState = ref.read(ucPresetNotifierProvider);
+    final ucPresetContent = ref
+        .read(ucPresetNotifierProvider.notifier)
+        .getEffectiveContent(params.model);
+
+    return resolvePromptPresetSettings(
+      prompt: params.prompt,
+      negativePrompt: params.negativePrompt,
+      qualityMode: qualityState.mode,
+      qualityContent: qualityContent,
+      ucPresetType: ucState.presetType,
+      ucPresetContent: ucPresetContent,
+      useCustomUcPreset: ucState.isCustom,
+    );
+  }
+
+  Future<void> generate(ImageParams params) async {
+    final generationRunId = _startGenerationRun();
+
+    // 获取抽卡模式设置
+    final randomMode = ref.read(randomPromptModeProvider);
+
+    // 检查队列执行状态 - 队列运行时不应用抽卡模式
+    // 使用 try-catch 避免循环依赖错误（QueueExecutionNotifier 监听 ImageGenerationNotifier）
+    bool isQueueExecuting = false;
+    try {
+      final queueExecutionState = ref.read(queueExecutionNotifierProvider);
+      isQueueExecuting =
+          queueExecutionState.isRunning || queueExecutionState.isReady;
+    } catch (e) {
+      // 循环依赖或 provider 未初始化时，默认不在队列执行中
+      isQueueExecuting = false;
+    }
+
+    // 如果开启抽卡模式且不在队列执行中，先随机提示词再生成
+    // 这样生成的图像和显示的提示词能对应上
+    // 队列执行时跳过抽卡模式，使用队列任务的原始提示词
+    ImageParams effectiveParams = params;
+    if (randomMode && !isQueueExecuting) {
+      final randomPrompt = await generateAndApplyRandomPrompt();
+      if (_shouldAbortGenerationRun(generationRunId)) return;
+      if (randomPrompt.isNotEmpty) {
+        AppLogger.d(
+          'Random prompt before generation: $randomPrompt',
+          'RandomMode',
+        );
+        // 重新读取角色配置（已被 generateAndApplyRandomPrompt 更新）
+        final characterConfig = ref.read(characterPromptNotifierProvider);
+        final apiCharacters = _convertCharactersToApiFormat(characterConfig);
+        effectiveParams = params.copyWith(
+          prompt: randomPrompt,
+          characters: apiCharacters,
+          useCoords:
+              apiCharacters.isNotEmpty && !characterConfig.globalAiChoice,
+        );
+      }
+    }
+
+    // 开始生成前清空当前图片
+    state = state.copyWith(
+      currentImages: [],
+      status: GenerationStatus.generating,
+      batchWidth: effectiveParams.width,
+      batchHeight: effectiveParams.height,
+    );
+
+    // nSamples = 批次数量（请求次数）
+    // batchSize = 每次请求生成的图片数量
+    final batchCount = effectiveParams.nSamples;
+    final batchSize = ref.read(imagesPerRequestProvider);
+    final totalImages = batchCount * batchSize;
+
+    // 解析别名（将 <词库名> 展开为实际内容）
+    // 统一在此处解析所有提示词（主提示词、负向提示词）
+    final aliasResolver = ref.read(aliasResolverServiceProvider.notifier);
+    final promptWithAliases =
+        aliasResolver.resolveAliases(effectiveParams.prompt);
+    final negativeWithAliases =
+        aliasResolver.resolveAliases(effectiveParams.negativePrompt);
+    if (promptWithAliases != effectiveParams.prompt ||
+        negativeWithAliases != effectiveParams.negativePrompt) {
+      AppLogger.d(
+        'Resolved aliases in prompts',
+        'AliasResolver',
+      );
+      effectiveParams = effectiveParams.copyWith(
+        prompt: promptWithAliases,
+        negativePrompt: negativeWithAliases,
+      );
+    }
+
+    // 应用固定词到提示词
+    final fixedTagsState = ref.read(fixedTagsNotifierProvider);
+    final promptWithFixedTags =
+        fixedTagsState.applyToPrompt(effectiveParams.prompt);
+    final negativePromptWithFixedTags =
+        fixedTagsState.applyToNegativePrompt(effectiveParams.negativePrompt);
+    if (promptWithFixedTags != effectiveParams.prompt ||
+        negativePromptWithFixedTags != effectiveParams.negativePrompt) {
+      AppLogger.d(
+        'Applied fixed tags: positive=${fixedTagsState.enabledCount}, negative=${fixedTagsState.negativeEnabledCount}',
+        'FixedTags',
+      );
+      effectiveParams = effectiveParams.copyWith(
+        prompt: promptWithFixedTags,
+        negativePrompt: negativePromptWithFixedTags,
+      );
+    }
+
+    final presetResolution = _resolvePromptPresets(effectiveParams);
+    effectiveParams = effectiveParams.copyWith(
+      prompt: presetResolution.prompt,
+      negativePrompt: presetResolution.negativePrompt,
+    );
+
+    // 读取多角色提示词配置并转换为 API 格式
+    final characterConfig = ref.read(characterPromptNotifierProvider);
+    final apiCharacters = _convertCharactersToApiFormat(characterConfig);
+
+    // NAI 官方预设保持为 API 开关；自定义预设展开成显式提示词，避免官方预设重复生效。
+    final ImageParams baseParams = effectiveParams.copyWith(
+      qualityToggle: presetResolution.qualityToggle,
+      ucPreset: presetResolution.ucPreset,
+      characters: apiCharacters,
+      // 如果有角色且使用自定义位置，启用坐标模式
+      useCoords: apiCharacters.isNotEmpty && !characterConfig.globalAiChoice,
+    );
+    final preparedParams = await _prepareVibesForGeneration(baseParams);
+    if (_shouldAbortGenerationRun(generationRunId)) return;
+
+    // 如果只生成 1 张，直接生成；随机种子在进入请求前实体化，便于失败快照保留真实 seed。
+    if (batchCount == 1 && batchSize == 1) {
+      await _generateSingle(
+        _materializeRandomSeed(preparedParams),
+        1,
+        1,
+        generationRunId,
+      );
+      // 注意：生成完成通知由 QueueExecutionNotifier 统一管理
+      // 点数消耗由 AnlasBalanceWatcher 自动监听余额变化记录
+      return;
+    }
+
+    // 多张图片：按批次循环请求
+    state = state.copyWith(
+      status: GenerationStatus.generating,
+      progress: 0.0,
+      errorMessage: null,
+      currentImage: 1,
+      totalImages: totalImages,
+      currentImages: [],
+      batchWidth: preparedParams.width,
+      batchHeight: preparedParams.height,
+    );
+
+    final allImages = <GeneratedImage>[];
+    final random = Random();
+    int generatedImages = 0;
+    Object? lastBatchError;
+    DateTime? concurrencyDeadline;
+
+    // 当前使用的参数（可能会被抽卡模式修改）
+    ImageParams currentParams = preparedParams;
+
+    for (int batch = 0; batch < batchCount; batch++) {
+      if (_shouldAbortGenerationRun(generationRunId)) break;
+
+      // 如果开启抽卡模式且不是第一批且不在队列执行中，先随机新提示词再生成
+      // 第一批已在方法开头随机过了
+      // 队列执行时跳过抽卡模式
+      if (randomMode && batch > 0 && !isQueueExecuting) {
+        final randomPrompt = await generateAndApplyRandomPrompt();
+        if (_shouldAbortGenerationRun(generationRunId)) return;
+        if (randomPrompt.isNotEmpty) {
+          AppLogger.d(
+            'Batch ${batch + 1}/$batchCount - Random before generation: $randomPrompt',
+            'RandomMode',
+          );
+          // 重新读取角色配置并更新参数
+          final newCharacterConfig = ref.read(characterPromptNotifierProvider);
+          final newApiCharacters =
+              _convertCharactersToApiFormat(newCharacterConfig);
+          currentParams = currentParams.copyWith(
+            prompt: randomPrompt,
+            characters: newApiCharacters,
+            useCoords: newApiCharacters.isNotEmpty &&
+                !newCharacterConfig.globalAiChoice,
+          );
+        }
+      }
+
+      // 更新当前进度
+      state = state.copyWith(
+        currentImage: generatedImages + 1,
+        progress: generatedImages / totalImages,
+      );
+
+      // 每批使用不同的随机种子
+      final batchParams = currentParams.copyWith(
+        nSamples: batchSize,
+        seed: random.nextInt(_randomSeedExclusiveUpperBound),
+      );
+
+      try {
+        // 使用流式 API 生成，支持预览
+        final imageBytes = await _generateBatchWithStream(
+          batchParams,
+          generatedImages + 1,
+          totalImages,
+          generationRunId,
+        );
+        if (_shouldAbortGenerationRun(generationRunId)) return;
+        if (imageBytes.isNotEmpty) {
+          // 将字节数据包装成带唯一ID的 GeneratedImage
+          final generatedList = imageBytes
+              .map(
+                (b) => GeneratedImage.create(
+                  b,
+                  width: batchParams.width,
+                  height: batchParams.height,
+                ),
+              )
+              .toList();
+          allImages.addAll(generatedList);
+          generatedImages += imageBytes.length;
+          // 立即更新显示和历史
+          state = state.copyWith(
+            currentImages: List.from(allImages),
+            history: [...generatedList, ...state.history].take(50).toList(),
+            clearStreamPreview: true,
+          );
+          _retainSharePreparationCacheForCurrentHistory();
+        } else {
+          generatedImages += batchSize; // 即使失败也要跳过，避免死循环
+        }
+      } catch (e) {
+        if (_isCancelledError(e, generationRunId)) {
+          if (_isCurrentGenerationRun(generationRunId)) {
+            _appendFailedStreamSnapshotToHistory(
+              generationRunId: generationRunId,
+              imageNumber: generatedImages + 1,
+            );
+            state = state.copyWith(
+              status: GenerationStatus.cancelled,
+              progress: 0.0,
+              currentImage: 0,
+              totalImages: 0,
+              clearStreamPreview: true,
+            );
+          }
+          // 点数消耗由 AnlasBalanceWatcher 自动监听余额变化记录
+          return;
+        }
+        // 并发限制：等待 NAI 释放额度后重试当前批次（取消可随时中断）
+        if (_isConcurrencyLimited(e)) {
+          concurrencyDeadline ??= DateTime.now().add(_concurrencyRetryBudget);
+          if (DateTime.now().isBefore(concurrencyDeadline)) {
+            AppLogger.w(
+              'NAI 并发限制(429)，${_concurrencyRetryInterval.inSeconds}s 后自动重试第 ${batch + 1} 批',
+              'Generation',
+            );
+            await Future.delayed(_concurrencyRetryInterval);
+            if (_shouldAbortGenerationRun(generationRunId)) return;
+            batch--;
+            continue;
+          }
+        }
+        // 本批次失败，继续下一批
+        _appendFailedStreamSnapshotToHistory(
+          generationRunId: generationRunId,
+          imageNumber: generatedImages + 1,
+        );
+        lastBatchError = e;
+        AppLogger.e('生成第 ${batch + 1} 批失败: $e');
+        generatedImages += batchSize;
+      }
+    }
+
+    if (!_isCurrentGenerationRun(generationRunId)) return;
+
+    if (!_isCancelled && allImages.isEmpty) {
+      state = state.copyWith(
+        status: GenerationStatus.error,
+        errorMessage:
+            lastBatchError?.toString() ?? 'No images returned from generation',
+        progress: 0.0,
+        currentImage: 0,
+        totalImages: 0,
+        clearStreamPreview: true,
+      );
+      return;
+    }
+
+    // 1. 瞬间宣告完成！彻底清除 UI 闪烁和空预览框残影！
+    state = state.copyWith(
+      status: _isCancelled
+          ? GenerationStatus.cancelled
+          : GenerationStatus.completed,
+      currentImages: List.from(allImages),
+      displayImages: List.from(allImages),
+      displayWidth: preparedParams.width,
+      displayHeight: preparedParams.height,
+      progress: 1.0,
+      currentImage: 0,
+      totalImages: 0,
+      clearStreamPreview: true, // 👈 核心指令：命令 UI 立即销毁流式预览框！
+    );
+
+    // 【后台收尾工作开始】(由于状态已是 completed，队列会在此刻无缝启动下一任务)
+
+    // 2. 刷新 Anlas 余额
+    await ref.read(subscriptionNotifierProvider.notifier).refreshBalance();
+
+    // 3. 稳稳地在后台保存图片！
+    // 🚨 核心修复：我们去掉了原作者那个会导致队列截胡的 _shouldAbort 检查，
+    // 仅仅检查 _isCancelled（只要不是用户主动点取消，就必须给我保存完！）
+    if (!_isCancelled && allImages.isNotEmpty) {
+      await _autoSaveIfEnabled(allImages, preparedParams);
+      
+      // 顺手补上原作者在单图里写了，但在批量里忘了写的“元数据预加载”优化
+      _preloadMetadataInBackground(allImages);
+    }
+  }
+  
+  /// 自动保存图像（如果启用）
+  Future<void> _autoSaveIfEnabled(
+    List<GeneratedImage> images,
+    ImageParams params,
+  ) async {
+    final saveSettings = ref.read(imageSaveSettingsNotifierProvider);
+    await _saveImagesToGallery(
+      images,
+      params,
+      saveImages: saveSettings.autoSave,
+    );
+  }
+
+  /// 将外部结果登记到历史记录，并可选地直接保存到本地图库
+  ///
+  /// [addToDisplay] 为 true 时，将图像插入中央预览列表首位（如 ComfyUI 超分结果）。
+  Future<String?> registerExternalImage(
+    Uint8List imageBytes, {
+    required ImageParams params,
+    int? width,
+    int? height,
+    bool saveToLocal = false,
+    String? saveDirectoryPath,
+    bool syncToGalleryIndex = true,
+    bool addToDisplay = false,
+  }) async {
+    final resolvedSize = _resolveImageSize(
+          imageBytes,
+          width: width,
+          height: height,
+        ) ??
+        (params.width, params.height);
+
+    final existingMetadata =
+        await ImageMetadataService().getMetadataFromBytes(imageBytes);
+    final effectiveParams = params.copyWith(
+      width: resolvedSize.$1,
+      height: resolvedSize.$2,
+    );
+    final normalizedBytes = await ImageSaveUtils.rebuildImageBytesWithMetadata(
+      imageBytes: imageBytes,
+      params: effectiveParams,
+      actualSeed: existingMetadata?.seed,
+    );
+
+    final generatedImage = GeneratedImage.create(
+      normalizedBytes,
+      width: resolvedSize.$1,
+      height: resolvedSize.$2,
+    );
+
+    state = state.copyWith(
+      currentImages: addToDisplay
+          ? [generatedImage, ...state.currentImages]
+          : state.currentImages,
+      history: [generatedImage, ...state.history].take(50).toList(),
+      displayImages: addToDisplay
+          ? [generatedImage, ...state.displayImages]
+          : state.displayImages,
+      displayWidth: addToDisplay ? resolvedSize.$1 : state.displayWidth,
+      displayHeight: addToDisplay ? resolvedSize.$2 : state.displayHeight,
+    );
+    _retainSharePreparationCacheForCurrentHistory();
+
+    if (saveToLocal) {
+      await _saveImagesToGallery(
+        [generatedImage],
+        effectiveParams,
+        saveImages: true,
+        saveDirectoryPath: saveDirectoryPath,
+        syncToGalleryIndex: syncToGalleryIndex,
+      );
+      return _firstSavedPathForImage(generatedImage.id);
+    }
+
+    _preloadMetadataInBackground([generatedImage]);
+    return null;
+  }
+
+  String? _firstSavedPathForImage(String id) {
+    for (final image in state.history) {
+      if (image.id == id && image.filePath != null) {
+        return image.filePath;
+      }
+    }
+    return null;
+  }
+
+  Future<void> _saveImagesToGallery(
+    List<GeneratedImage> images,
+    ImageParams params, {
+    required bool saveImages,
+    String? saveDirectoryPath,
+    bool syncToGalleryIndex = true,
+  }) async {
+    if (!saveImages) return;
+
+    try {
+      final saveDirPath = saveDirectoryPath ??
+          await GalleryFolderRepository.instance.getRootPath();
+      if (saveDirPath == null) return;
+      final saveDir = Directory(saveDirPath);
+      if (!await saveDir.exists()) {
+        await saveDir.create(recursive: true);
+      }
+
+      // 使用已解析别名的角色提示词（来自 params.characters）
+      final characterConfig = ref.read(characterPromptNotifierProvider);
+
+      // 获取固定词信息
+      final fixedTagsState = ref.read(fixedTagsNotifierProvider);
+      final fixedPrefixTags = fixedTagsState.enabledPrefixes
+          .sortedByOrder()
+          .map((e) => e.weightedContent)
+          .where((c) => c.isNotEmpty)
+          .toList();
+      final fixedSuffixTags = fixedTagsState.enabledSuffixes
+          .sortedByOrder()
+          .map((e) => e.weightedContent)
+          .where((c) => c.isNotEmpty)
+          .toList();
+      final fixedNegativePrefixTags = fixedTagsState.negativeEnabledPrefixes
+          .sortedByOrder()
+          .map((e) => e.weightedContent)
+          .where((c) => c.isNotEmpty)
+          .toList();
+      final fixedNegativeSuffixTags = fixedTagsState.negativeEnabledSuffixes
+          .sortedByOrder()
+          .map((e) => e.weightedContent)
+          .where((c) => c.isNotEmpty)
+          .toList();
+
+      AppLogger.i(
+        '[ImageGeneration] Fixed tags for save: positive=${fixedTagsState.enabledCount}, negative=${fixedTagsState.negativeEnabledCount}, prefix=$fixedPrefixTags, suffix=$fixedSuffixTags, negativePrefix=$fixedNegativePrefixTags, negativeSuffix=$fixedNegativeSuffixTags',
+        'ImageGeneration',
+      );
+
+      // 构建 V4 多角色提示词结构（直接使用已解析的 params.characters）
+      final charCaptions = <Map<String, dynamic>>[];
+      final charNegCaptions = <Map<String, dynamic>>[];
+
+      for (final char in params.characters) {
+        charCaptions.add({
+          'char_caption': char.prompt,
+          'centers': [
+            {'x': 0.5, 'y': 0.5},
+          ],
+        });
+        charNegCaptions.add({
+          'char_caption': char.negativePrompt,
+          'centers': [
+            {'x': 0.5, 'y': 0.5},
+          ],
+        });
+      }
+
+      int savedCount = 0;
+      final savedFilePaths = <String>[];
+      final savedImages = <GeneratedImage>[];
+
+      for (final image in images) {
+        try {
+          final fileName = 'NAI_${DateTime.now().millisecondsSinceEpoch}.png';
+          final filePath = p.join(saveDirPath, fileName);
+
+          if (ImageSaveUtils.hasEmbeddedNovelAiMetadata(image.bytes)) {
+            await File(filePath).writeAsBytes(image.bytes);
+            savedCount++;
+            savedFilePaths.add(filePath);
+
+            final updatedImage = image.copyWithFilePath(filePath);
+            _updateImageInState(image.id, updatedImage);
+            savedImages.add(updatedImage);
+
+            await Future.delayed(const Duration(milliseconds: 2));
+            continue;
+          }
+
+          // 从图片元数据中提取实际的 seed
+          int actualSeed = params.seed;
+          if (params.seed == -1) {
+            final extractedMeta =
+                await ImageMetadataService().getMetadataFromBytes(image.bytes);
+            if (extractedMeta != null &&
+                extractedMeta.seed != null &&
+                extractedMeta.seed! > 0) {
+              actualSeed = extractedMeta.seed!;
+            } else {
+              actualSeed = Random().nextInt(4294967295);
+            }
+          }
+
+          AppLogger.i(
+            '[ImageGeneration] Saving image with fixed_prefix=$fixedPrefixTags, fixed_suffix=$fixedSuffixTags, fixed_negative_prefix=$fixedNegativePrefixTags, fixed_negative_suffix=$fixedNegativeSuffixTags',
+            'ImageGeneration',
+          );
+
+          await ImageSaveUtils.saveImageWithMetadata(
+            imageBytes: image.bytes,
+            filePath: filePath,
+            params: params,
+            actualSeed: actualSeed,
+            fixedPrefixTags: fixedPrefixTags,
+            fixedSuffixTags: fixedSuffixTags,
+            fixedNegativePrefixTags: fixedNegativePrefixTags,
+            fixedNegativeSuffixTags: fixedNegativeSuffixTags,
+            charCaptions: charCaptions,
+            charNegCaptions: charNegCaptions,
+            useCoords: !characterConfig.globalAiChoice,
+            useStealth: false,
+          );
+          savedCount++;
+          savedFilePaths.add(filePath);
+
+          // 更新 filePath 到 GeneratedImage
+          final updatedImage = image.copyWithFilePath(filePath);
+          _updateImageInState(image.id, updatedImage);
+          savedImages.add(updatedImage);
+
+          // 避免文件名冲突
+          await Future.delayed(const Duration(milliseconds: 2));
+        } catch (e) {
+          AppLogger.e('自动保存图像失败: $e');
+        }
+      }
+
+      if (savedCount > 0) {
+        if (syncToGalleryIndex) {
+          // 【优化】使用即时添加新图像，避免全量扫描延迟
+          final galleryNotifier =
+              ref.read(localGalleryNotifierProvider.notifier);
+          final addedCount =
+              await galleryNotifier.addNewlySavedImages(savedFilePaths);
+
+          // 如果即时添加失败或数量不匹配，回退到传统刷新方式
+          if (addedCount < savedCount) {
+            AppLogger.w(
+              '[AutoSave] Immediate add returned $addedCount, expected $savedCount. Falling back to refresh.',
+              'AutoSave',
+            );
+            await galleryNotifier.refresh();
+          } else {
+            AppLogger.i(
+              '[AutoSave] Added $addedCount new images immediately without full scan',
+              'AutoSave',
+            );
+          }
+        }
+
+        // 增量更新统计缓存，避免下次启动时完全重新计算
+        try {
+          final cacheService = ref.read(statisticsCacheServiceProvider);
+          await cacheService.incrementImageCount(savedCount);
+        } catch (e) {
+          AppLogger.w('统计缓存增量更新失败: $e', 'AutoSave');
+        }
+
+        if (savedImages.isNotEmpty) {
+          _preloadMetadataInBackground(savedImages);
+        }
+
+        AppLogger.d('自动保存完成: $savedCount 张图像', 'AutoSave');
+      }
+    } catch (e) {
+      AppLogger.e('自动保存失败: $e');
+    }
+  }
+
+  /// 检查错误是否为取消操作
+  bool _hasCancelledText(dynamic error) =>
+      error.toString().toLowerCase().contains('cancelled');
+
+  bool _isCancelledError(dynamic error, [int? generationRunId]) {
+    final runWasCancelled = generationRunId == null
+        ? _isCancelled
+        : _shouldAbortGenerationRun(generationRunId);
+    if (runWasCancelled) return true;
+
+    // Current generation paths have run ids. Do not convert a remote
+    // "Cancelled" error into a user cancellation unless this run is stale.
+    return generationRunId == null && _hasCancelledText(error);
+  }
+
+  bool _isRemoteCancelledError(dynamic error, int generationRunId) =>
+      !_shouldAbortGenerationRun(generationRunId) && _hasCancelledText(error);
+
+  /// NAI 并发限制（429）自动等待重试。
+  /// 取消生成后服务器仍会占用账号并发额度直至孤儿任务结束，
+  /// 期间新请求会立即 429；自动等待释放而不是直接报错。
+  static const Duration _concurrencyRetryInterval = Duration(seconds: 3);
+  static const Duration _concurrencyRetryBudget = Duration(seconds: 90);
+
+  bool _isConcurrencyLimited(dynamic error) {
+    if (error is DioException) return error.response?.statusCode == 429;
+    return error.toString().contains('API_ERROR_429');
+  }
+
+  /// 检查错误是否为流式不支持
+  bool _isStreamingNotAllowed(String error) {
+    final lower = error.toLowerCase();
+    return lower.contains('streaming is not allowed') ||
+        lower.contains('streaming not allowed') ||
+        lower.contains('stream is not allowed') ||
+        lower.contains('stream not allowed');
+  }
+
+  /// 带重试的生成
+  Future<(List<Uint8List>, Map<int, String>)> _generateWithRetry(
+    ImageParams params,
+    int generationRunId,
+  ) async {
+    final apiService = ref.read(naiImageGenerationApiServiceProvider);
+    final workflow = ref.read(imageWorkflowControllerProvider);
+
+    for (int retry = 0; retry <= _maxRetries; retry++) {
+      try {
+        if (_shouldAbortGenerationRun(generationRunId)) {
+          throw StateError('Generation cancelled');
+        }
+
+        final result = await apiService.generateImage(
+          params,
+          onProgress: (_, __) {},
+          focusedInpaintEnabled: workflow.focusedInpaintEnabled,
+          minimumContextMegaPixels: workflow.minimumContextMegaPixels,
+          focusedSelectionRect: workflow.focusedSelectionRect,
+        );
+        if (_shouldAbortGenerationRun(generationRunId)) {
+          throw StateError('Generation cancelled');
+        }
+        return result;
+      } catch (e) {
+        if (_isCancelledError(e, generationRunId)) rethrow;
+        if (_isRemoteCancelledError(e, generationRunId)) rethrow;
+        if (_isConcurrencyLimited(e)) rethrow; // 交给上层等待并发额度释放
+
+        if (retry < _maxRetries) {
+          AppLogger.w(
+            '生成失败，${_retryDelays[retry]}ms 后重试 (${retry + 1}/$_maxRetries): $e',
+          );
+          await Future.delayed(Duration(milliseconds: _retryDelays[retry]));
+          if (_shouldAbortGenerationRun(generationRunId)) {
+            throw StateError('Generation cancelled');
+          }
+        } else {
+          rethrow;
+        }
+      }
+    }
+
+    return (<Uint8List>[], <int, String>{});
+  }
+
+  /// 保存 Vibe 编码哈希到状态
+  ///
+  /// [vibeEncodings] 索引到编码哈希的映射
+  void _saveVibeEncodings(Map<int, String> vibeEncodings) {
+    AppLogger.d(
+      'Saving ${vibeEncodings.length} Vibe encodings to state',
+      'Generation',
+    );
+    for (final entry in vibeEncodings.entries) {
+      final index = entry.key;
+      final encoding = entry.value;
+      if (encoding.isNotEmpty) {
+        ref
+            .read(generationParamsNotifierProvider.notifier)
+            .updateVibeReference(index, vibeEncoding: encoding);
+        AppLogger.d(
+          'Saved Vibe encoding for index $index (hash length: ${encoding.length})',
+          'Generation',
+        );
+      }
+    }
+  }
+
+  /// 使用流式 API 生成批次图像（支持真正的并发请求与流式预览！）
+  Future<List<Uint8List>> _generateBatchWithStream(
+    ImageParams params,
+    int currentStart,
+    int total,
+    int generationRunId,
+  ) async {
+    final apiService = ref.read(naiImageGenerationApiServiceProvider);
+    final workflow = ref.read(imageWorkflowControllerProvider);
+    final seededParams = _materializeRandomSeed(params);
+    final batchSize = seededParams.nSamples; // 👈 这次，咱们把真正的并发数送给官方！
+    final images = <Uint8List>[];
+    bool useNonStreamFallback = false;
+
+    // 更新总进度到当前批次起点
+    state = state.copyWith(
+      currentImage: currentStart,
+      progress: (currentStart - 1) / total,
+      clearStreamPreview: true,
+    );
+
+    final useFocusedNonStream = workflow.focusedInpaintEnabled &&
+        seededParams.action == ImageGenerationAction.infill;
+
+    for (int retry = 0; retry <= _maxRetries; retry++) {
+      try {
+        // 1. 非流式回退模式 (一口气并发生成)
+        if (useNonStreamFallback || useFocusedNonStream) {
+          final fallback = await apiService.generateImageCancellable(
+            seededParams, // 👈 原封不动地传递 batchSize
+            onProgress: (_, __) {},
+            focusedInpaintEnabled: workflow.focusedInpaintEnabled,
+            minimumContextMegaPixels: workflow.minimumContextMegaPixels,
+            focusedSelectionRect: workflow.focusedSelectionRect,
+          );
+          if (_shouldAbortGenerationRun(generationRunId)) return images;
+          if (fallback.isNotEmpty) {
+            images.addAll(fallback);
+            break; // 成功即跳出重试
+          }
+          continue;
+        }
+
+        // 2. 官方流式并发模式 (完美支持同时渲染多张并预览)
+        var streamingNotAllowed = false;
+        final finalImages = <int, Uint8List>{};
+        int completedInBatch = 0;
+
+        await for (final chunk in apiService.generateImageStream(
+          seededParams, // 👈 发起真正的并发流式请求！
+          focusedInpaintEnabled: workflow.focusedInpaintEnabled,
+          minimumContextMegaPixels: workflow.minimumContextMegaPixels,
+          focusedSelectionRect: workflow.focusedSelectionRect,
+        )) {
+          if (_shouldAbortGenerationRun(generationRunId)) return images;
+
+          if (chunk.hasError) {
+            if (_isStreamingNotAllowed(chunk.error ?? '')) {
+              AppLogger.w('Streaming not allowed, falling back to non-stream API', 'Generation');
+              streamingNotAllowed = true;
+              useNonStreamFallback = true;
+              break;
+            }
+            throw Exception(chunk.error);
+          }
+
+          if (chunk.hasPreview) {
+            final globalIndex = currentStart - 1 + chunk.sampleIndex;
+            _rememberStreamPreview(
+              bytes: chunk.previewImage!,
+              params: seededParams,
+              generationRunId: generationRunId,
+              imageNumber: globalIndex + 1, 
+            );
+            
+            // 👇 直接调用新写法的 update 方法，瞬间分发，绝对不报错！
+            ref.read(streamPreviewsProvider.notifier).updatePreview(globalIndex, chunk.previewImage!);
+
+            state = state.copyWith(
+              progress: (currentStart - 1 + completedInBatch + chunk.progress) / total,
+              streamPreview: chunk.previewImage,
+            );
+       
+          }
+                    
+          if (chunk.isComplete && chunk.hasFinalImage) {
+            finalImages[chunk.sampleIndex] = chunk.finalImage!;
+            completedInBatch++;
+            state = state.copyWith(
+              currentImage: currentStart + completedInBatch - 1,
+              progress: (currentStart - 1 + completedInBatch) / total,
+            );
+            _clearRememberedStreamPreview(
+              generationRunId: generationRunId,
+              imageNumber: currentStart + chunk.sampleIndex,
+            );
+          }
+        }
+
+        // 如果报错流式不支持，回退非流式
+        if (streamingNotAllowed) {
+          final fallback = await apiService.generateImageCancellable(
+            seededParams,
+            onProgress: (_, __) {},
+            focusedInpaintEnabled: workflow.focusedInpaintEnabled,
+            minimumContextMegaPixels: workflow.minimumContextMegaPixels,
+            focusedSelectionRect: workflow.focusedSelectionRect,
+          );
+          if (_shouldAbortGenerationRun(generationRunId)) return images;
+          if (fallback.isNotEmpty) {
+            images.addAll(fallback);
+            break;
+          }
+          continue;
+        }
+
+        // 成功获取全部图片，按顺序拼装
+        if (finalImages.isNotEmpty) {
+          final orderedImages = finalImages.entries.toList()..sort((a, b) => a.key.compareTo(b.key));
+          images.addAll(orderedImages.map((e) => e.value));
+          break; // 成功即跳出重试
+        }
+
+        // 万一既没报错也没图返回，兜底非流式
+        final fallback = await apiService.generateImageCancellable(
+          seededParams,
+          onProgress: (_, __) {},
+          focusedInpaintEnabled: workflow.focusedInpaintEnabled,
+          minimumContextMegaPixels: workflow.minimumContextMegaPixels,
+          focusedSelectionRect: workflow.focusedSelectionRect,
+        );
+        if (_shouldAbortGenerationRun(generationRunId)) return images;
+        if (fallback.isNotEmpty) {
+          images.addAll(fallback);
+          break;
+        }
+
+      } catch (e) {
+        // ---- 各种错误与取消拦截保持原样 ----
+        if (_isCancelledError(e, generationRunId)) {
+          _appendFailedStreamSnapshotToHistory(
+            generationRunId: generationRunId,
+            imageNumber: currentStart,
+          );
+          return images;
+        }
+        if (_isRemoteCancelledError(e, generationRunId)) rethrow;
+        if (_isConcurrencyLimited(e)) rethrow;
+
+        if (_isStreamingNotAllowed(e.toString())) {
+          useNonStreamFallback = true;
+          try {
+            final fallback = await apiService.generateImageCancellable(
+              seededParams,
+              onProgress: (_, __) {},
+              focusedInpaintEnabled: workflow.focusedInpaintEnabled,
+              minimumContextMegaPixels: workflow.minimumContextMegaPixels,
+              focusedSelectionRect: workflow.focusedSelectionRect,
+            );
+            if (_shouldAbortGenerationRun(generationRunId)) return images;
+            if (fallback.isNotEmpty) images.addAll(fallback);
+          } catch (fallbackError) {
+            _appendFailedStreamSnapshotToHistory(
+              generationRunId: generationRunId,
+              imageNumber: currentStart,
+            );
+          }
+          break;
+        }
+
+        if (retry < _maxRetries) {
+          await Future.delayed(Duration(milliseconds: _retryDelays[retry]));
+          if (_shouldAbortGenerationRun(generationRunId)) return images;
+        } else {
+          _appendFailedStreamSnapshotToHistory(
+            generationRunId: generationRunId,
+            imageNumber: currentStart,
+          );
+          rethrow;
+        }
+      }
+    }
+
+    return images;
+  }
+  
+  /// 生成单张（使用流式 API 支持渐进式预览）
+  Future<void> _generateSingle(
+    ImageParams params,
+    int current,
+    int total,
+    int generationRunId, {
+    DateTime? concurrencyDeadline,
+  }) async {
+    if (_shouldAbortGenerationRun(generationRunId)) return;
+
+    state = state.copyWith(
+      status: GenerationStatus.generating,
+      progress: 0.0,
+      errorMessage: null,
+      currentImage: current,
+      totalImages: total,
+      clearStreamPreview: true,
+    );
+
+    try {
+      final apiService = ref.read(naiImageGenerationApiServiceProvider);
+      final workflow = ref.read(imageWorkflowControllerProvider);
+      final useFocusedNonStream = workflow.focusedInpaintEnabled &&
+          params.action == ImageGenerationAction.infill;
+
+      if (useFocusedNonStream) {
+        final (imageBytes, vibeEncodings) = await _generateWithRetry(
+          params,
+          generationRunId,
+        );
+
+        if (_shouldAbortGenerationRun(generationRunId)) return;
+
+        if (imageBytes.isEmpty) {
+          throw Exception('No images returned from focused inpaint request');
+        }
+
+        final generatedList = imageBytes
+            .map(
+              (bytes) => GeneratedImage.create(
+                bytes,
+                width: params.width,
+                height: params.height,
+              ),
+            )
+            .toList();
+
+        if (vibeEncodings.isNotEmpty) {
+          _saveVibeEncodings(vibeEncodings);
+        }
+
+        state = state.copyWith(
+          status: GenerationStatus.completed,
+          progress: 1.0,
+          currentImage: 0,
+          totalImages: 0,
+          currentImages: generatedList,
+          displayImages: generatedList,
+          displayWidth: params.width,
+          displayHeight: params.height,
+          history: [...generatedList, ...state.history].take(50).toList(),
+          clearStreamPreview: true,
+        );
+        _retainSharePreparationCacheForCurrentHistory();
+        await _autoSaveIfEnabled(generatedList, params);
+        _preloadMetadataInBackground(generatedList);
+        return;
+      }
+
+      final stream = apiService.generateImageStream(
+        params,
+        focusedInpaintEnabled: workflow.focusedInpaintEnabled,
+        minimumContextMegaPixels: workflow.minimumContextMegaPixels,
+        focusedSelectionRect: workflow.focusedSelectionRect,
+      );
+
+      final finalImages = <int, Uint8List>{};
+      bool streamingNotAllowed = false;
+
+      await for (final chunk in stream) {
+        if (_shouldAbortGenerationRun(generationRunId)) return;
+
+        if (chunk.hasError) {
+          if (_isStreamingNotAllowed(chunk.error ?? '')) {
+            AppLogger.w(
+              'Streaming not allowed, falling back to non-stream API',
+              'Generation',
+            );
+            streamingNotAllowed = true;
+            break;
+          }
+          if (_isConcurrencyLimited(chunk.error ?? '') &&
+              DateTime.now().isBefore(
+                concurrencyDeadline ??=
+                    DateTime.now().add(_concurrencyRetryBudget),
+              )) {
+            // 并发限制：等待 NAI 释放额度后自动重试（取消可随时中断）
+            AppLogger.w(
+              'NAI 并发限制(429)，${_concurrencyRetryInterval.inSeconds}s 后自动重试',
+              'Generation',
+            );
+            await Future.delayed(_concurrencyRetryInterval);
+            if (_shouldAbortGenerationRun(generationRunId)) return;
+            return _generateSingle(
+              params,
+              current,
+              total,
+              generationRunId,
+              concurrencyDeadline: concurrencyDeadline,
+            );
+          }
+          _appendFailedStreamSnapshotToHistory(
+            generationRunId: generationRunId,
+            imageNumber: current,
+          );
+          state = state.copyWith(
+            status: GenerationStatus.error,
+            errorMessage: chunk.error,
+            progress: 0.0,
+            currentImage: 0,
+            totalImages: 0,
+            clearStreamPreview: true,
+          );
+          return;
+        }
+
+        if (chunk.hasPreview) {
+          // 更新流式预览
+          if (_shouldAbortGenerationRun(generationRunId)) return;
+          _rememberStreamPreview(
+            bytes: chunk.previewImage!,
+            params: params,
+            generationRunId: generationRunId,
+            imageNumber: current,
+          );
+          state = state.copyWith(
+            progress: chunk.progress,
+            streamPreview: chunk.previewImage,
+          );
+        }
+
+        if (chunk.isComplete && chunk.hasFinalImage) {
+          finalImages[chunk.sampleIndex] = chunk.finalImage!;
+        }
+      }
+
+      // 如果流式不被支持，回退到非流式 API
+      if (streamingNotAllowed) {
+        final (imageBytes, vibeEncodings) = await _generateWithRetry(
+          params,
+          generationRunId,
+        );
+        if (_shouldAbortGenerationRun(generationRunId)) return;
+        if (imageBytes.isEmpty) {
+          throw Exception('No images returned from generation');
+        }
+        final generatedList = imageBytes
+            .map(
+              (b) => GeneratedImage.create(
+                b,
+                width: params.width,
+                height: params.height,
+              ),
+            )
+            .toList();
+        state = state.copyWith(
+          status: GenerationStatus.completed,
+          currentImages: generatedList,
+          displayImages: generatedList,
+          displayWidth: params.width,
+          displayHeight: params.height,
+          history: [...generatedList, ...state.history].take(50).toList(),
+          progress: 1.0,
+          currentImage: 0,
+          totalImages: 0,
+          clearStreamPreview: true,
+        );
+        _retainSharePreparationCacheForCurrentHistory();
+        _clearRememberedStreamPreview(
+          generationRunId: generationRunId,
+          imageNumber: current,
+        );
+        // 保存 Vibe 编码哈希到状态
+        if (vibeEncodings.isNotEmpty) {
+          _saveVibeEncodings(vibeEncodings);
+        }
+        // 自动保存
+        await _autoSaveIfEnabled(generatedList, params);
+        // 后台预解析元数据（不阻塞）
+        _preloadMetadataInBackground(generatedList);
+        return;
+      }
+
+      if (finalImages.isNotEmpty) {
+        if (_shouldAbortGenerationRun(generationRunId)) return;
+        final orderedImages = finalImages.entries.toList()
+          ..sort((a, b) => a.key.compareTo(b.key));
+        final generatedList = orderedImages
+            .map(
+              (entry) => GeneratedImage.create(
+                entry.value,
+                width: params.width,
+                height: params.height,
+              ),
+            )
+            .toList();
+        state = state.copyWith(
+          status: GenerationStatus.completed,
+          currentImages: generatedList,
+          displayImages: generatedList,
+          displayWidth: params.width,
+          displayHeight: params.height,
+          history: [...generatedList, ...state.history].take(50).toList(),
+          progress: 1.0,
+          currentImage: 0,
+          totalImages: 0,
+          clearStreamPreview: true,
+        );
+        _retainSharePreparationCacheForCurrentHistory();
+        _clearRememberedStreamPreview(
+          generationRunId: generationRunId,
+          imageNumber: current,
+        );
+        // 自动保存
+        await _autoSaveIfEnabled(generatedList, params);
+        // 后台预解析元数据（不阻塞）
+        _preloadMetadataInBackground(generatedList);
+      } else {
+        // 流式 API 未返回图像，回退到非流式 API
+        AppLogger.w(
+          'Stream API returned no image, falling back to non-stream API',
+          'Generation',
+        );
+        final (imageBytes, vibeEncodings) = await _generateWithRetry(
+          params,
+          generationRunId,
+        );
+        if (_shouldAbortGenerationRun(generationRunId)) return;
+        if (imageBytes.isEmpty) {
+          throw Exception('No images returned from generation');
+        }
+        final generatedList = imageBytes
+            .map(
+              (b) => GeneratedImage.create(
+                b,
+                width: params.width,
+                height: params.height,
+              ),
+            )
+            .toList();
+        state = state.copyWith(
+          status: GenerationStatus.completed,
+          currentImages: generatedList,
+          displayImages: generatedList,
+          displayWidth: params.width,
+          displayHeight: params.height,
+          history: [...generatedList, ...state.history].take(50).toList(),
+          progress: 1.0,
+          currentImage: 0,
+          totalImages: 0,
+          clearStreamPreview: true,
+        );
+        _retainSharePreparationCacheForCurrentHistory();
+        _clearRememberedStreamPreview(
+          generationRunId: generationRunId,
+          imageNumber: current,
+        );
+        // 保存 Vibe 编码哈希到状态
+        if (vibeEncodings.isNotEmpty) {
+          _saveVibeEncodings(vibeEncodings);
+        }
+        // 自动保存
+        await _autoSaveIfEnabled(generatedList, params);
+        // 后台预解析元数据（不阻塞）
+        _preloadMetadataInBackground(generatedList);
+      }
+    } catch (e) {
+      if (_isCancelledError(e, generationRunId)) {
+        if (_isCurrentGenerationRun(generationRunId)) {
+          _appendFailedStreamSnapshotToHistory(
+            generationRunId: generationRunId,
+            imageNumber: current,
+          );
+          state = state.copyWith(
+            status: GenerationStatus.cancelled,
+            progress: 0.0,
+            currentImage: 0,
+            totalImages: 0,
+            clearStreamPreview: true,
+          );
+        }
+      } else if (_isConcurrencyLimited(e) &&
+          DateTime.now().isBefore(
+            concurrencyDeadline ??= DateTime.now().add(_concurrencyRetryBudget),
+          )) {
+        // 并发限制：等待 NAI 释放额度后自动重试（取消可随时中断）
+        AppLogger.w(
+          'NAI 并发限制(429)，${_concurrencyRetryInterval.inSeconds}s 后自动重试',
+          'Generation',
+        );
+        await Future.delayed(_concurrencyRetryInterval);
+        if (_shouldAbortGenerationRun(generationRunId)) return;
+        return _generateSingle(
+          params,
+          current,
+          total,
+          generationRunId,
+          concurrencyDeadline: concurrencyDeadline,
+        );
+      } else if (_isStreamingNotAllowed(e.toString())) {
+        AppLogger.w(
+          'Streaming not allowed (exception), falling back to non-stream API',
+          'Generation',
+        );
+        try {
+          final (imageBytes, vibeEncodings) = await _generateWithRetry(
+            params,
+            generationRunId,
+          );
+          if (_shouldAbortGenerationRun(generationRunId)) return;
+          if (imageBytes.isEmpty) {
+            throw Exception('No images returned from generation');
+          }
+          final generatedList = imageBytes
+              .map(
+                (b) => GeneratedImage.create(
+                  b,
+                  width: params.width,
+                  height: params.height,
+                ),
+              )
+              .toList();
+          state = state.copyWith(
+            status: GenerationStatus.completed,
+            currentImages: generatedList,
+            displayImages: generatedList,
+            displayWidth: params.width,
+            displayHeight: params.height,
+            history: [...generatedList, ...state.history].take(50).toList(),
+            progress: 1.0,
+            currentImage: 0,
+            totalImages: 0,
+            clearStreamPreview: true,
+          );
+          _retainSharePreparationCacheForCurrentHistory();
+          _clearRememberedStreamPreview(
+            generationRunId: generationRunId,
+            imageNumber: current,
+          );
+          if (vibeEncodings.isNotEmpty) {
+            _saveVibeEncodings(vibeEncodings);
+          }
+          await _autoSaveIfEnabled(generatedList, params);
+          if (_shouldAbortGenerationRun(generationRunId)) return;
+          // 后台预解析元数据（不阻塞）
+          _preloadMetadataInBackground(generatedList);
+        } catch (fallbackError) {
+          if (_isCancelledError(fallbackError, generationRunId) ||
+              !_isCurrentGenerationRun(generationRunId)) {
+            if (_isCurrentGenerationRun(generationRunId)) {
+              _appendFailedStreamSnapshotToHistory(
+                generationRunId: generationRunId,
+                imageNumber: current,
+              );
+            }
+            return;
+          }
+          _appendFailedStreamSnapshotToHistory(
+            generationRunId: generationRunId,
+            imageNumber: current,
+          );
+          state = state.copyWith(
+            status: GenerationStatus.error,
+            errorMessage: fallbackError.toString(),
+            progress: 0.0,
+            currentImage: 0,
+            totalImages: 0,
+            clearStreamPreview: true,
+          );
+        }
+      } else {
+        if (!_isCurrentGenerationRun(generationRunId)) return;
+        _appendFailedStreamSnapshotToHistory(
+          generationRunId: generationRunId,
+          imageNumber: current,
+        );
+        state = state.copyWith(
+          status: GenerationStatus.error,
+          errorMessage: e.toString(),
+          progress: 0.0,
+          currentImage: 0,
+          totalImages: 0,
+          clearStreamPreview: true,
+        );
+      }
+    }
+  }
+
+  /// 取消生成
+  void cancel() {
+    final generationRunId = _activeGenerationRunId;
+    final imageNumber = state.currentImage > 0 ? state.currentImage : 1;
+    _appendFailedStreamSnapshotToHistory(
+      generationRunId: generationRunId,
+      imageNumber: imageNumber,
+    );
+    _invalidateGenerationRun();
+    final apiService = ref.read(naiImageGenerationApiServiceProvider);
+    apiService.cancelGeneration();
+
+    state = state.copyWith(
+      status: GenerationStatus.cancelled,
+      progress: 0.0,
+      currentImage: 0,
+      totalImages: 0,
+    );
+  }
+
+  /// 清除当前图像
+  void clearCurrent() {
+    state = state.copyWith(
+      currentImages: [],
+      status: GenerationStatus.idle,
+    );
+    _retainSharePreparationCacheForCurrentHistory();
+  }
+
+  /// 清除错误
+  void clearError() {
+    if (state.status == GenerationStatus.error) {
+      state = state.copyWith(
+        status: GenerationStatus.idle,
+        errorMessage: null,
+      );
+    }
+  }
+
+  /// 清除历史记录（包含当前批次图像）
+  void clearHistory() {
+    state = state.copyWith(
+      currentImages: [],
+      history: [],
+    );
+    _retainSharePreparationCacheForCurrentHistory();
+  }
+
+  /// 更新显示图像列表
+  ///
+  /// 用于保存图像后更新 filePath 等信息
+  void updateDisplayImages(List<GeneratedImage> images) {
+    state = state.copyWith(
+      displayImages: images,
+    );
+  }
+
+  /// 更新指定生成图像的本地文件路径。
+  void updateImageFilePath(String imageId, String filePath) {
+    GeneratedImage? image;
+    for (final candidate in [
+      ...state.currentImages,
+      ...state.history,
+      ...state.displayImages,
+    ]) {
+      if (candidate.id == imageId) {
+        image = candidate;
+        break;
+      }
+    }
+
+    if (image == null) return;
+    _updateImageInState(imageId, image.copyWithFilePath(filePath));
+  }
+
+  /// 更新状态中的单个图像
+  ///
+  /// 用于自动保存后更新图像的 filePath
+  void _updateImageInState(String imageId, GeneratedImage updatedImage) {
+    // 更新 currentImages
+    final updatedCurrentImages = state.currentImages.map((img) {
+      return img.id == imageId ? updatedImage : img;
+    }).toList();
+
+    // 更新 history
+    final updatedHistory = state.history.map((img) {
+      return img.id == imageId ? updatedImage : img;
+    }).toList();
+
+    // 更新 displayImages
+    final updatedDisplayImages = state.displayImages.map((img) {
+      return img.id == imageId ? updatedImage : img;
+    }).toList();
+
+    state = state.copyWith(
+      currentImages: updatedCurrentImages,
+      history: updatedHistory,
+      displayImages: updatedDisplayImages,
+    );
+    _retainSharePreparationCacheForCurrentHistory();
+
+    AppLogger.d(
+      'Updated filePath for image $imageId: ${updatedImage.filePath}',
+      'AutoSave',
+    );
+  }
+
+  /// 将 UI 层的角色提示词配置转换为 API 层的格式
+  ///
+  /// [config] UI 层的角色提示词配置
+  /// 返回 API 层的 CharacterPrompt 列表
+  ///
+  /// 注意：此方法会统一解析角色提示词中的别名
+  List<CharacterPrompt> _convertCharactersToApiFormat(
+    ui_character.CharacterPromptConfig config,
+  ) {
+    // 过滤出启用且有提示词的角色
+    final enabledCharacters = config.characters
+        .where((c) => c.enabled && c.prompt.isNotEmpty)
+        .toList();
+
+    if (enabledCharacters.isEmpty) {
+      return [];
+    }
+
+    // 获取别名解析器统一解析角色提示词
+    final aliasResolver = ref.read(aliasResolverServiceProvider.notifier);
+
+    return enabledCharacters.map((uiChar) {
+      // 计算位置字符串
+      String? position;
+      if (!config.globalAiChoice &&
+          uiChar.positionMode == ui_character.CharacterPositionMode.custom &&
+          uiChar.customPosition != null) {
+        position = uiChar.customPosition!.toNaiString();
+      }
+
+      // 解析角色提示词中的别名
+      return CharacterPrompt(
+        prompt: aliasResolver.resolveAliases(uiChar.prompt),
+        negativePrompt: aliasResolver.resolveAliases(uiChar.negativePrompt),
+        position: position,
+      );
+    }).toList();
+  }
+
+  /// 统一随机提示词生成并应用方法
+  ///
+  /// 此方法是随机按钮和自动随机模式的唯一入口
+  /// 生成随机提示词并自动应用到主提示词和角色提示词
+  ///
+  /// [seed] 随机种子（可选）
+  /// 返回生成的主提示词字符串（用于日志/显示）
+  Future<String> generateAndApplyRandomPrompt({int? seed}) async {
+    // 获取当前模型是否为 V4
+    final params = ref.read(generationParamsNotifierProvider);
+    final isV4Model = params.isV4Model;
+
+    // 使用统一的生成入口
+    final result = await ref
+        .read(promptConfigNotifierProvider.notifier)
+        .generateRandomPrompt(isV4Model: isV4Model, seed: seed);
+
+    // 格式化生成的提示词（空格转下划线等）
+    final formattedPrompt = NaiPromptFormatter.format(result.mainPrompt);
+
+    // 应用主提示词
+    ref
+        .read(generationParamsNotifierProvider.notifier)
+        .updatePrompt(formattedPrompt);
+
+    // 记录格式化信息
+    if (formattedPrompt != result.mainPrompt) {
+      AppLogger.d(
+        'Formatted random prompt: ${result.mainPrompt} → $formattedPrompt',
+        'RandomMode',
+      );
+    }
+
+    // 应用角色提示词（同时进行格式化）
+    if (result.hasCharacters && isV4Model) {
+      final characterPrompts = result.toCharacterPrompts().map((char) {
+        return char.copyWith(
+          prompt: NaiPromptFormatter.format(char.prompt),
+          negativePrompt: char.negativePrompt.isNotEmpty
+              ? NaiPromptFormatter.format(char.negativePrompt)
+              : char.negativePrompt,
+        );
+      }).toList();
+      AppLogger.d(
+        'Random result: ${result.characterCount} characters, prompts: ${characterPrompts.length}',
+        'RandomMode',
+      );
+      for (var i = 0; i < characterPrompts.length; i++) {
+        AppLogger.d(
+          'Character $i: ${characterPrompts[i].prompt}',
+          'RandomMode',
+        );
+      }
+      ref
+          .read(characterPromptNotifierProvider.notifier)
+          .replaceAll(characterPrompts);
+
+      AppLogger.d(
+        'Applied ${result.characterCount} characters from random generation',
+        'RandomMode',
+      );
+    } else if (result.noHumans) {
+      // 无人物场景，清空角色
+      ref.read(characterPromptNotifierProvider.notifier).clearAll();
+      AppLogger.d('No humans scene, cleared characters', 'RandomMode');
+    }
+
+    return formattedPrompt;
+  }
+
+  // ============================================================
+  // 后台元数据解析（生成完成后立即启动）
+  // ============================================================
+
+  /// 后台并行解析图像元数据
+  ///
+  /// 在图像生成完成后立即启动，将图像加入预加载队列。
+  /// 队列会按顺序处理，支持连续生成多张图像时的排队机制。
+  /// 这样用户打开详情页时元数据已经准备好了，无需等待。
+  void _preloadMetadataInBackground(List<GeneratedImage> images) {
+    if (images.isEmpty) return;
+
+    final service = ImageMetadataService();
+
+    AppLogger.d(
+      'Enqueuing ${images.length} images for metadata preloading',
+      'MetadataPreload',
+    );
+
+    // 将图像加入预加载队列
+    for (final image in images) {
+      service.enqueuePreload(
+        taskId: image.id,
+        filePath: image.filePath,
+        bytes: image.filePath == null ? image.bytes : null,
+      );
+    }
+
+    // 输出队列状态
+    final status = service.getPreloadQueueStatus();
+    AppLogger.d(
+      'Preload queue status: length=${status['queueLength']}, '
+          'processing=${status['processingCount']}, isProcessing=${status['isProcessing']}',
+      'MetadataPreload',
+    );
+  }
+
+  (int, int)? _resolveImageSize(
+    Uint8List imageBytes, {
+    int? width,
+    int? height,
+  }) {
+    if (width != null && height != null) {
+      return (width, height);
+    }
+
+    final decoded = img.decodeImage(imageBytes);
+    if (decoded == null) {
+      return null;
+    }
+
+    return (decoded.width, decoded.height);
+  }
+}

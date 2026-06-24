@@ -1,0 +1,197 @@
+import 'package:dio/dio.dart';
+
+import '../../../core/utils/app_logger.dart';
+import '../models/prompt_assistant_models.dart';
+import 'provider_adapters/anthropic_messages_adapter.dart';
+import 'provider_adapters/gemini_generate_content_adapter.dart';
+import 'provider_adapters/openai_chat_completions_adapter.dart';
+import 'provider_adapters/openai_responses_adapter.dart';
+import 'provider_adapters/prompt_assistant_adapter.dart';
+
+class PromptAssistantApiClient {
+  PromptAssistantApiClient({
+    required Dio dio,
+    this.imageUploadMaxBytes = promptAssistantImageUploadMaxBytes, // 🌟 新增：合并PC端参数
+  }) : _dio = dio;
+
+  final Dio _dio;
+  final int imageUploadMaxBytes; // 🌟 新增：图片上传最大体积限制
+  final Map<String, CancelToken> _cancelTokens = {};
+  void cancelCurrentRequest({String? sessionId}) {
+    if (sessionId == null || sessionId.isEmpty) {
+      for (final token in _cancelTokens.values) {
+        token.cancel('cancelled by user');
+      }
+      _cancelTokens.clear();
+      return;
+    }
+
+    final token = _cancelTokens.remove(sessionId);
+    token?.cancel('cancelled by user');
+  }
+
+  Future<List<String>> fetchModels({
+    required ProviderConfig provider,
+    required String? apiKey,
+  }) {
+    final defaults = provider.preset?.defaultModelNames ?? const [];
+    return _adapterFor(provider)
+        .fetchModels(dio: _dio, provider: provider, apiKey: apiKey)
+        .then((models) => models.isEmpty ? defaults : models);
+  }
+
+  Stream<StreamingChunk> complete({
+    required PromptAssistantRequest request,
+  }) async* {
+    _cancelTokens.remove(request.sessionId)?.cancel('replaced by new request');
+    final cancelToken = CancelToken();
+    _cancelTokens[request.sessionId] = cancelToken;
+
+    try {
+      AppLogger.d(
+        'request start provider=${request.provider.id} '
+            'protocol=${request.provider.protocol.name} model=${request.model}',
+        'PromptAssistant',
+      );
+
+      // 🌟 新功能合并：在发送给大模型前，自动优化/压缩图片体积，防止 Payload Too Large 报错！
+      final uploadRequest = await optimizePromptAssistantRequestImagesForUpload(
+        request,
+        maxBytes: imageUploadMaxBytes,
+      );
+      
+      final content = await _adapterFor(uploadRequest.provider).complete(
+        dio: _dio,
+        request: uploadRequest, // 🌟 使用优化后的请求
+        cancelToken: cancelToken,
+      );
+      final trimmed = content.trim();      
+      if (trimmed.isEmpty) {
+        throw StateError(
+          'LLM 服务返回空内容：provider=${request.provider.name}, model=${request.model}',
+        );
+      }
+
+      AppLogger.d(
+        'response done provider=${request.provider.id} '
+            'model=${request.model} outputLen=${trimmed.length} '
+            'output=${_previewBody(trimmed)}',
+        'PromptAssistant',
+      );
+      yield StreamingChunk(delta: trimmed);
+      yield const StreamingChunk(delta: '', done: true);
+    } finally {
+      if (identical(_cancelTokens[request.sessionId], cancelToken)) {
+        _cancelTokens.remove(request.sessionId);
+      }
+    }
+  }
+
+  // Legacy wrapper kept so older tests/callers that already build OpenAI-style
+  // messages continue to work while the service layer migrates to typed parts.
+  Stream<StreamingChunk> streamChat({
+    required String sessionId,
+    required ProviderConfig provider,
+    required String model,
+    required List<Map<String, dynamic>> messages,
+    required String? apiKey,
+  }) {
+    return complete(
+      request: PromptAssistantRequest(
+        sessionId: sessionId,
+        provider: provider,
+        model: model,
+        systemPrompt: _extractSystemPrompt(messages),
+        userParts: _extractUserParts(messages),
+        apiKey: apiKey,
+      ),
+    );
+  }
+
+  PromptAssistantProviderAdapter _adapterFor(ProviderConfig provider) {
+    switch (provider.protocol) {
+      case ProviderProtocol.openaiChatCompletions:
+        return const OpenAiChatCompletionsAdapter();
+      case ProviderProtocol.openaiResponses:
+        return const OpenAiResponsesAdapter();
+      case ProviderProtocol.anthropicMessages:
+        return const AnthropicMessagesAdapter();
+      case ProviderProtocol.geminiGenerateContent:
+        return const GeminiGenerateContentAdapter();
+      case ProviderProtocol.ollamaChatCompletions:
+        return const OpenAiChatCompletionsAdapter(ollamaTagsFallback: true);
+    }
+  }
+
+  static String _extractSystemPrompt(List<Map<String, dynamic>> messages) {
+    for (final message in messages) {
+      if (message['role'] == 'system') {
+        return contentToText(message['content']);
+      }
+    }
+    return '';
+  }
+
+  static List<PromptAssistantContentPart> _extractUserParts(
+    List<Map<String, dynamic>> messages,
+  ) {
+    final parts = <PromptAssistantContentPart>[];
+    for (final message in messages) {
+      if (message['role'] != 'user') continue;
+      _appendContentParts(parts, message['content']);
+    }
+    return parts.isEmpty ? const [PromptAssistantTextPart('')] : parts;
+  }
+
+  static void _appendContentParts(
+    List<PromptAssistantContentPart> parts,
+    dynamic content,
+  ) {
+    if (content is String) {
+      parts.add(PromptAssistantTextPart(content));
+      return;
+    }
+    if (content is List) {
+      for (final item in content) {
+        if (item is Map<String, dynamic>) {
+          final type = item['type'];
+          if (type == 'text') {
+            parts.add(PromptAssistantTextPart(contentToText(item['text'])));
+          } else if (type == 'image_url') {
+            final imageUrl = item['image_url'];
+            final url = imageUrl is Map ? imageUrl['url'] : null;
+            if (url is String) {
+              final parsed = parseDataUriImage(url);
+              if (parsed != null) {
+                parts.add(
+                  PromptAssistantImagePart(
+                    bytes: parsed.bytes,
+                    mimeType: parsed.mimeType,
+                  ),
+                );
+              }
+            }
+          }
+        } else {
+          final text = contentToText(item);
+          if (text.isNotEmpty) {
+            parts.add(PromptAssistantTextPart(text));
+          }
+        }
+      }
+      return;
+    }
+    final text = contentToText(content);
+    if (text.isNotEmpty) {
+      parts.add(PromptAssistantTextPart(text));
+    }
+  }
+
+  String _previewBody(String raw) {
+    final normalized = raw.replaceAll(RegExp(r'\s+'), ' ').trim();
+    if (normalized.length <= 300) {
+      return normalized;
+    }
+    return '${normalized.substring(0, 300)}...';
+  }
+}

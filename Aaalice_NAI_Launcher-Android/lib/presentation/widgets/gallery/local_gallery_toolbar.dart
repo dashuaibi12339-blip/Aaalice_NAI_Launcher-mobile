@@ -1,0 +1,807 @@
+import 'dart:async';
+import 'dart:ui' as ui;
+import 'dart:io';
+import '../../../data/repositories/gallery_folder_repository.dart';
+import 'package:open_filex/open_filex.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:path/path.dart' as path;
+
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:flutter/services.dart';
+import 'package:intl/intl.dart';
+import '../../providers/gallery_category_provider.dart';
+import '../common/themed_input_dialog.dart';
+
+import '../../../core/shortcuts/default_shortcuts.dart';
+import '../../providers/local_gallery_provider.dart';
+import '../../providers/selection_mode_provider.dart';
+import '../bulk_action_bar.dart';
+import '../common/compact_icon_button.dart';
+import '../gallery_filter_panel.dart';
+import '../grouped_grid_view.dart' show ImageDateGroup;
+
+import '../common/app_toast.dart';
+import '../autocomplete/autocomplete_wrapper.dart';
+import '../autocomplete/autocomplete_controller.dart';
+import '../autocomplete/strategies/local_tag_strategy.dart';
+
+/// Local gallery toolbar with search, filter and actions
+/// 本地画廊工具栏（搜索、过滤、操作按钮）
+class LocalGalleryToolbar extends ConsumerStatefulWidget {
+  /// Whether 3D card view mode is active
+  /// 是否启用3D卡片视图模式
+  final bool use3DCardView;
+
+  /// Callback when view mode is toggled
+  /// 视图模式切换回调
+  final VoidCallback? onToggleViewMode;
+
+  /// Callback when open folder button is pressed
+  /// 打开文件夹按钮回调
+  final VoidCallback? onOpenFolder;
+
+  /// Callback when refresh button is pressed
+  /// 刷新按钮回调
+  final VoidCallback? onRefresh;
+
+  /// Callback when enter selection mode button is pressed
+  /// 进入选择模式按钮回调
+  final VoidCallback? onEnterSelectionMode;
+
+  /// Callback when undo button is pressed
+  /// 撤销按钮回调
+  final VoidCallback? onUndo;
+
+  /// Callback when redo button is pressed
+  /// 重做按钮回调
+  final VoidCallback? onRedo;
+
+  /// Whether undo is available
+  /// 是否可撤销
+  final bool canUndo;
+
+  /// Whether redo is available
+  /// 是否可重做
+  final bool canRedo;
+
+  /// Key for GroupedGridView to scroll to group
+  /// 用于滚动到分组的 GroupedGridView key
+  final GlobalKey? groupedGridViewKey;
+
+  /// Callbacks for bulk actions
+  /// 批量操作回调
+  final VoidCallback? onAddToCollection;
+  final VoidCallback? onDeleteSelected;
+  final VoidCallback? onPackSelected;
+  final VoidCallback? onEditMetadata;
+  final VoidCallback? onMoveToFolder;
+
+  /// Whether category panel is visible
+  /// 是否显示分类面板
+  final bool showCategoryPanel;
+
+  /// Callback when category panel toggle is pressed
+  /// 分类面板切换按钮回调
+  final VoidCallback? onToggleCategoryPanel;
+
+  /// Whether search autocomplete is enabled.
+  /// 是否启用搜索自动补全。
+  final bool enableSearchAutocomplete;
+
+  const LocalGalleryToolbar({
+    super.key,
+    this.use3DCardView = true,
+    this.onToggleViewMode,
+    this.onOpenFolder,
+    this.onRefresh,
+    this.onEnterSelectionMode,
+    this.onUndo,
+    this.onRedo,
+    this.canUndo = false,
+    this.canRedo = false,
+    this.groupedGridViewKey,
+    this.onAddToCollection,
+    this.onDeleteSelected,
+    this.onPackSelected,
+    this.onEditMetadata,
+    this.onMoveToFolder,
+    this.showCategoryPanel = true,
+    this.onToggleCategoryPanel,
+    this.enableSearchAutocomplete = true,
+  });
+
+  @override
+  ConsumerState<LocalGalleryToolbar> createState() =>
+      _LocalGalleryToolbarState();
+}
+
+class _LocalGalleryToolbarState extends ConsumerState<LocalGalleryToolbar> {
+  final TextEditingController _searchController = TextEditingController();
+  late final FocusNode _searchFocusNode;
+  Timer? _debounceTimer;
+  Future<LocalTagStrategy>? _searchStrategyFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _searchFocusNode = FocusNode(onKeyEvent: _handleSearchKeyEvent);
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    _searchFocusNode.dispose();
+    _debounceTimer?.cancel();
+    // Future 不需要 dispose
+    super.dispose();
+  }
+
+  /// Search with debounce
+  /// 搜索防抖
+  void _onSearchChanged(String value) {
+    _debounceTimer?.cancel();
+    _debounceTimer = Timer(const Duration(milliseconds: 300), () {
+      ref.read(localGalleryNotifierProvider.notifier).setSearchQuery(value);
+    });
+  }
+
+  KeyEventResult _handleSearchKeyEvent(FocusNode node, KeyEvent event) {
+    if (event is! KeyDownEvent || event.logicalKey != LogicalKeyboardKey.keyA) {
+      return KeyEventResult.ignored;
+    }
+
+    final keyboard = HardwareKeyboard.instance;
+    if (!keyboard.isControlPressed && !keyboard.isMetaPressed) {
+      return KeyEventResult.ignored;
+    }
+
+    _searchController.selection = TextSelection(
+      baseOffset: 0,
+      extentOffset: _searchController.text.length,
+    );
+    return KeyEventResult.handled;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final state = ref.watch(localGalleryNotifierProvider);
+    final selectionState = ref.watch(localGallerySelectionNotifierProvider);
+    final theme = Theme.of(context);
+    final isDark = theme.brightness == Brightness.dark;
+
+    // Show bulk action bar when in selection mode
+    // 选择模式时显示批量操作栏
+    if (selectionState.isActive) {
+      final allImagePaths = state.currentImages.map((r) => r.path).toList();
+      final isAllSelected = allImagePaths.isNotEmpty &&
+          allImagePaths.every((p) => selectionState.selectedIds.contains(p));
+
+      return BulkActionBar(
+        selectedCount: selectionState.selectedIds.length,
+        isAllSelected: isAllSelected,
+        onExit: () =>
+            ref.read(localGallerySelectionNotifierProvider.notifier).exit(),
+        onSelectAll: () {
+          if (isAllSelected) {
+            ref
+                .read(localGallerySelectionNotifierProvider.notifier)
+                .clearSelection();
+          } else {
+            ref
+                .read(localGallerySelectionNotifierProvider.notifier)
+                .selectAll(allImagePaths);
+          }
+        },
+        actions: [
+          BulkActionItem(
+            icon: Icons.drive_file_move_outline,
+            label: '移动',
+            onPressed: widget.onMoveToFolder,
+            color: theme.colorScheme.secondary,
+          ),
+          BulkActionItem(
+            icon: Icons.archive_outlined,
+            label: '打包',
+            onPressed: widget.onPackSelected,
+            color: theme.colorScheme.tertiary,
+          ),
+          BulkActionItem(
+            icon: Icons.edit_outlined,
+            label: '编辑',
+            onPressed: widget.onEditMetadata,
+            color: theme.colorScheme.primary,
+          ),
+          BulkActionItem(
+            icon: Icons.playlist_add,
+            label: '收藏',
+            onPressed: widget.onAddToCollection,
+            color: theme.colorScheme.secondary,
+          ),
+          BulkActionItem(
+            icon: Icons.delete_outline,
+            label: '删除',
+            onPressed: widget.onDeleteSelected,
+            color: theme.colorScheme.error,
+            isDanger: true,
+            showDividerBefore: true,
+          ),
+        ],
+      );
+    }
+
+    // Normal toolbar
+    // 【极致单行滑块版 + 边缘渐隐视觉引导】
+    return ClipRRect(
+      child: BackdropFilter(
+        filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: SafeArea(
+          bottom: false, // 强行避开手机顶部状态栏和刘海
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: isDark
+                  ? theme.colorScheme.surfaceContainerHigh.withValues(alpha: 0.9)
+                  : theme.colorScheme.surface.withValues(alpha: 0.8),
+              border: Border(
+                bottom: BorderSide(
+                  color: theme.dividerColor.withValues(alpha: isDark ? 0.2 : 0.3),
+                ),
+              ),
+            ),
+            child: Row(
+              children: [
+                // 1. 左侧固定区：标题和数量
+                Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '本地画廊',
+                      style: theme.textTheme.titleSmall?.copyWith(
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    Text(
+                      state.hasFilters
+                          ? '${state.filteredCount}/${state.totalCount}'
+                          : '${state.totalCount}',
+                      style: theme.textTheme.labelSmall?.copyWith(
+                        color: theme.colorScheme.primary,
+                        fontSize: 10,
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(width: 12),
+                
+                // 2. 右侧滑动区：带 ShaderMask 渐隐引导
+                Expanded(
+                  child: ShaderMask(
+                    shaderCallback: (Rect bounds) {
+                      return LinearGradient(
+                        begin: Alignment.centerLeft,
+                        end: Alignment.centerRight,
+                        colors: [
+                          theme.colorScheme.surface,
+                          Colors.transparent,
+                          Colors.transparent,
+                          theme.colorScheme.surface,
+                        ],
+                        stops: const [0.0, 0.05, 0.95, 1.0], // 左右边缘 5% 渐隐
+                      ).createShader(bounds);
+                    },
+                    blendMode: BlendMode.dstOut,
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.horizontal,
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          // 搜索框
+                          SizedBox(
+                            width: 140,
+                            child: _buildSearchField(theme, state),
+                          ),
+                          const SizedBox(width: 8),
+                          
+                          // 日期筛选
+                          _buildDateRangeButton(theme, state),
+                          const SizedBox(width: 4),
+                          
+                          // 视图切换
+                          CompactIconButton(
+                            icon: state.isGroupedView ? Icons.view_module : Icons.calendar_today,
+                            label: state.isGroupedView ? '网格' : '日期',
+                            tooltip: state.isGroupedView ? '切换到网格视图' : '切换到日期分组',
+                            shortcutId: ShortcutIds.jumpToDate,
+                            isActive: state.isGroupedView,
+                            onPressed: () {
+                              if (state.isGroupedView) {
+                                ref.read(localGalleryNotifierProvider.notifier).setGroupedView(false);
+                              } else {
+                                _pickDateAndJump(context);
+                              }
+                            },
+                          ),
+                          const SizedBox(width: 4),
+                          
+                          // 筛选面板
+                          CompactIconButton(
+                            icon: Icons.tune,
+                            label: '筛选',
+                            tooltip: '打开筛选面板',
+                            shortcutId: ShortcutIds.openFilterPanel,
+                            onPressed: () => showGalleryFilterPanel(context),
+                          ),
+                          
+                          // 清除筛选
+                          if (state.hasFilters) ...[
+                            const SizedBox(width: 4),
+                            CompactIconButton(
+                              icon: Icons.filter_alt_off,
+                              label: '清除',
+                              tooltip: '清除筛选',
+                              shortcutId: ShortcutIds.clearFilter,
+                              isDanger: true,
+                              onPressed: () {
+                                _searchController.clear();
+                                ref.read(localGalleryNotifierProvider.notifier).clearAllFilters();
+                              },
+                            ),
+                          ],
+                          
+                          // 分隔线
+                          Padding(
+                            padding: const EdgeInsets.symmetric(horizontal: 6),
+                            child: Container(width: 1, height: 20, color: theme.dividerColor.withValues(alpha: 0.3)),
+                          ),
+                          
+                          // 分类面板切换
+                          if (widget.onToggleCategoryPanel != null) ...[
+                            CompactIconButton(
+                              icon: widget.showCategoryPanel
+                                  ? Icons.view_sidebar
+                                  : Icons.view_sidebar_outlined,
+                              label: '分类',
+                              tooltip: widget.showCategoryPanel ? '隐藏分类面板' : '显示分类面板',
+                              shortcutId: ShortcutIds.toggleCategoryPanel,
+                              onPressed: widget.onToggleCategoryPanel,
+                            ),
+                            const SizedBox(width: 4),
+                          ],
+                          
+                                                    
+                          // 撤销/重做
+                          if (widget.canUndo || widget.canRedo) ...[
+                            CompactIconButton(icon: Icons.undo, tooltip: '撤销', onPressed: widget.canUndo ? widget.onUndo : null),
+                            const SizedBox(width: 2),
+                            CompactIconButton(icon: Icons.redo, tooltip: '重做', onPressed: widget.canRedo ? widget.onRedo : null),
+                            const SizedBox(width: 4),
+                          ],
+                          
+                          // 多选
+                          CompactIconButton(
+                            icon: Icons.checklist,
+                            label: '多选',
+                            tooltip: '进入选择模式',
+                            shortcutId: ShortcutIds.enterSelectionMode,
+                            onPressed: widget.onEnterSelectionMode,
+                          ),
+                          const SizedBox(width: 4),
+                          
+                          // 导入图片
+                          CompactIconButton(
+                            icon: Icons.add_photo_alternate,
+                            label: '导入',
+                            tooltip: '导入外部图片到画廊',
+                            onPressed: () async {
+                              try {
+                                // 1. 弹出跨平台系统文件选择器
+                                final result = await FilePicker.platform.pickFiles(
+                                  type: FileType.custom,
+                                  allowedExtensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp'], 
+                                  allowMultiple: true,
+                                );
+                                                                
+                                if (result != null && result.files.isNotEmpty && context.mounted) {
+                                  // 👇 2. 弹出选择分类对话框
+                                  final selectedCategoryId = await showDialog<String>(
+                                    context: context,
+                                    builder: (dialogContext) => Consumer(
+                                      builder: (context, ref, _) {
+                                        final categoryState = ref.watch(galleryCategoryNotifierProvider);
+                                        final categories = categoryState.categories;
+
+                                        return AlertDialog(
+                                          title: const Text('导入到哪里？'),
+                                          content: SizedBox(
+                                            width: 300,
+                                            child: ListView.builder(
+                                              shrinkWrap: true,
+                                              itemCount: categories.length + 1,
+                                              itemBuilder: (context, index) {
+                                                if (index == 0) {
+                                                  return ListTile(
+                                                    leading: const Icon(Icons.photo_library_outlined),
+                                                    title: const Text('全部图片 (根目录)'),
+                                                    onTap: () => Navigator.of(dialogContext).pop('root_directory'),
+                                                  );
+                                                }
+                                                final category = categories[index - 1];
+                                                return ListTile(
+                                                  leading: const Icon(Icons.folder),
+                                                  title: Text(category.displayName),
+                                                  subtitle: Text('包含 ${category.imageCount} 张图片'),
+                                                  onTap: () => Navigator.of(dialogContext).pop(category.id),
+                                                );
+                                              },
+                                            ),
+                                          ),
+                                          actions: [
+                                            TextButton(
+                                              onPressed: () async {
+                                                // 实时新建分类
+                                                final name = await ThemedInputDialog.show(
+                                                  context: context,
+                                                  title: '新建分类',
+                                                  hintText: '请输入分类名称',
+                                                  confirmText: '创建',
+                                                  cancelText: '取消',
+                                                );
+                                                if (name != null && name.isNotEmpty) {
+                                                  final newCat = await ref
+                                                      .read(galleryCategoryNotifierProvider.notifier)
+                                                      .createCategory(name, parentId: null);
+                                                  if (newCat != null && dialogContext.mounted) {
+                                                    // 创建成功后自动选中该分类并关闭弹窗
+                                                    Navigator.of(dialogContext).pop(newCat.id);
+                                                  }
+                                                }
+                                              },
+                                              child: const Text('新建分类'),
+                                            ),
+                                            TextButton(
+                                              onPressed: () => Navigator.of(dialogContext).pop(),
+                                              child: const Text('取消'),
+                                            ),
+                                          ],
+                                        );
+                                      },
+                                    ),
+                                  );
+
+                                  if (selectedCategoryId == null || !context.mounted) return;
+
+                                  // 3. 解析目标文件夹的绝对物理路径
+                                  final rootPath = await GalleryFolderRepository.instance.getRootPath();
+                                  if (rootPath == null) {
+                                    AppToast.error(context, '无法获取画廊存储路径');
+                                    return;
+                                  }
+
+                                  String targetDirPath;
+                                  if (selectedCategoryId == 'root_directory') {
+                                    targetDirPath = rootPath;
+                                  } else {
+                                    final categories = ref.read(galleryCategoryNotifierProvider).categories;
+                                    // 查找对应的分类对象
+                                    final targetCategory = categories.cast<dynamic>().firstWhere(
+                                      (c) => c.id == selectedCategoryId,
+                                      orElse: () => null,
+                                    );
+                                    if (targetCategory == null) {
+                                      AppToast.error(context, '找不到目标分类文件夹');
+                                      return;
+                                    }
+                                    
+                                    // 👇 核心修复：如果只是相对路径(如 '123')，必须与 rootPath 拼接成绝对路径
+                                    final folderPath = targetCategory.folderPath as String;
+                                    if (path.isAbsolute(folderPath)) {
+                                      targetDirPath = folderPath;
+                                    } else {
+                                      targetDirPath = path.join(rootPath, folderPath);
+                                    }
+                                  }
+
+                                  // 确保目标文件夹在硬盘上真实存在
+                                  final targetDir = Directory(targetDirPath);
+                                  if (!await targetDir.exists()) {
+                                    await targetDir.create(recursive: true);
+                                  }
+                                  
+                                  int successCount = 0;
+                                  // 4. 遍历选中的图片，安全复制到目标目录下
+                                  for (var file in result.files) {
+                                    if (file.path != null) {
+                                      final sourceFile = File(file.path!);
+                                      final fileName = '${DateTime.now().millisecondsSinceEpoch}_${file.name}';
+                                      // 使用 path.join 安全拼接文件名
+                                      final destPath = path.join(targetDirPath, fileName);
+                                      
+                                      await sourceFile.copy(destPath);
+                                      successCount++;
+                                    }
+                                  }
+                                                                    
+                                  // 5. 强制底层 Provider 重新扫描文件夹并同步分类数量
+                                  ref.read(localGalleryNotifierProvider.notifier).refresh();
+                                  ref.read(galleryCategoryNotifierProvider.notifier).syncWithFileSystem();
+                                  
+                                  if (context.mounted) {
+                                    AppToast.success(context, '成功导入 $successCount 张图片！');
+                                  }
+                                }
+                              } catch (e) {
+                                if (context.mounted) {
+                                  AppToast.error(context, '导入失败: $e');
+                                }
+                              }
+                            },
+                          ),
+
+                          const SizedBox(width: 4),
+                          
+                          // 刷新
+                          CompactIconButton(
+                            icon: Icons.refresh,
+                            label: '刷新',
+                            tooltip: '刷新画廊',
+                            shortcutId: ShortcutIds.refreshGallery,
+                            onPressed: widget.onRefresh,
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+    
+  /// Build search field
+  /// Build search field
+  /// 构建搜索框 - 类似在线画廊的简洁圆角样式
+  Widget _buildSearchField(ThemeData theme, LocalGalleryState state) {
+    final searchField = Container(
+      height: 36,
+      constraints: const BoxConstraints(maxWidth: 300),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.4),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: TextField(
+        controller: _searchController,
+        focusNode: _searchFocusNode,
+        style: theme.textTheme.bodyMedium,
+        decoration: InputDecoration(
+          hintText: '搜索文件名或 Prompt...',
+          hintStyle: TextStyle(
+            color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.5),
+            fontSize: 13,
+          ),
+          prefixIcon: Icon(
+            Icons.search,
+            size: 18,
+            color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.6),
+          ),
+          suffixIcon: _searchController.text.isNotEmpty
+              ? IconButton(
+                  icon: Icon(
+                    Icons.close,
+                    size: 16,
+                    color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.6),
+                  ),
+                  onPressed: () {
+                    _searchController.clear();
+                    ref
+                        .read(localGalleryNotifierProvider.notifier)
+                        .setSearchQuery('');
+                    setState(() {});
+                  },
+                )
+              : null,
+          border: InputBorder.none,
+          contentPadding: const EdgeInsets.symmetric(vertical: 8),
+          isDense: true,
+        ),
+        onChanged: (value) {
+          setState(() {}); // 更新清除按钮可见性
+          _onSearchChanged(value);
+        },
+        onSubmitted: (value) {
+          _debounceTimer?.cancel();
+          ref.read(localGalleryNotifierProvider.notifier).setSearchQuery(value);
+        },
+      ),
+    );
+
+    if (!widget.enableSearchAutocomplete) {
+      return searchField;
+    }
+
+    // 缓存策略 Future，避免每次build都创建新的
+    _searchStrategyFuture ??= LocalTagStrategy.create(
+      ref,
+      const AutocompleteConfig(
+        minQueryLength: 2,
+        maxSuggestions: 8,
+        showTranslation: true,
+        showCategory: true,
+        showCount: true,
+      ),
+    );
+
+    return AutocompleteWrapper(
+      controller: _searchController,
+      focusNode: _searchFocusNode,
+      asyncStrategy: _searchStrategyFuture!,
+      onSuggestionSelected: (value) {
+        // 选择补全建议后立即触发搜索
+        _debounceTimer?.cancel();
+        ref.read(localGalleryNotifierProvider.notifier).setSearchQuery(value);
+      },
+      child: searchField,
+    );
+  }
+  
+  /// Build date range button
+  /// 构建日期范围按钮
+  Widget _buildDateRangeButton(ThemeData theme, LocalGalleryState state) {
+    final hasDateRange = state.filterCriteria.dateStart != null || state.filterCriteria.dateEnd != null;
+
+    return OutlinedButton.icon(
+      onPressed: () => _selectDateRange(context, state),
+      icon: Icon(
+        Icons.date_range,
+        size: 16,
+        color: hasDateRange ? theme.colorScheme.primary : null,
+      ),
+      label: Text(
+        hasDateRange
+            ? _formatDateRange(state.filterCriteria.dateStart, state.filterCriteria.dateEnd)
+            : '日期过滤',
+        style: TextStyle(
+          fontSize: 12,
+          color: hasDateRange ? theme.colorScheme.primary : null,
+        ),
+      ),
+      style: OutlinedButton.styleFrom(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+        visualDensity: VisualDensity.compact,
+        side:
+            hasDateRange ? BorderSide(color: theme.colorScheme.primary) : null,
+      ),
+    );
+  }
+
+  /// Format date range display
+  /// 格式化日期范围显示
+  String _formatDateRange(DateTime? start, DateTime? end) {
+    final format = DateFormat('MM-dd');
+    if (start != null && end != null) {
+      return '${format.format(start)}~${format.format(end)}';
+    } else if (start != null) {
+      return '${format.format(start)}~';
+    } else if (end != null) {
+      return '~${format.format(end)}';
+    }
+    return '';
+  }
+
+  /// Select date range
+  /// 选择日期范围
+  Future<void> _selectDateRange(
+    BuildContext context,
+    LocalGalleryState state,
+  ) async {
+    final now = DateTime.now();
+    final picked = await showDateRangePicker(
+      context: context,
+      firstDate: DateTime(2020),
+      lastDate: now,
+      initialDateRange: state.filterCriteria.dateStart != null && state.filterCriteria.dateEnd != null
+          ? DateTimeRange(start: state.filterCriteria.dateStart!, end: state.filterCriteria.dateEnd!)
+          : DateTimeRange(
+              start: now.subtract(const Duration(days: 30)),
+              end: now,
+            ),
+      builder: (context, child) {
+        return Theme(
+          data: Theme.of(context).copyWith(
+            dialogTheme: DialogThemeData(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+
+    if (picked != null) {
+      ref.read(localGalleryNotifierProvider.notifier).setDateRange(
+            picked.start,
+            picked.end,
+          );
+    }
+  }
+
+  /// Pick date and jump to corresponding group
+  /// 选择日期并跳转到对应分组
+  Future<void> _pickDateAndJump(BuildContext context) async {
+    final now = DateTime.now();
+
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: now,
+      firstDate: DateTime(2020),
+      lastDate: now,
+      builder: (pickerContext, child) {
+        return Theme(
+          data: Theme.of(pickerContext).copyWith(
+            dialogTheme: DialogThemeData(
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+              ),
+            ),
+          ),
+          child: child!,
+        );
+      },
+    );
+
+    if (picked != null && mounted) {
+      // Ensure grouped view is activated
+      final currentState = ref.read(localGalleryNotifierProvider);
+      final notifier = ref.read(localGalleryNotifierProvider.notifier);
+      if (!currentState.isGroupedView) {
+        notifier.setGroupedView(true);
+      }
+
+      // Wait for grouped data to load
+      await Future.delayed(const Duration(milliseconds: 300));
+
+      if (!mounted) return;
+
+      // Calculate which group the selected date belongs to
+      final today = DateTime(now.year, now.month, now.day);
+      final yesterday = today.subtract(const Duration(days: 1));
+      final thisWeekStart = today.subtract(Duration(days: today.weekday - 1));
+      final selectedDate = DateTime(picked.year, picked.month, picked.day);
+
+      ImageDateGroup? targetGroup;
+
+      if (selectedDate == today) {
+        targetGroup = ImageDateGroup.today;
+      } else if (selectedDate == yesterday) {
+        targetGroup = ImageDateGroup.yesterday;
+      } else if (selectedDate.isAfter(thisWeekStart) &&
+          selectedDate.isBefore(today)) {
+        targetGroup = ImageDateGroup.thisWeek;
+      } else {
+        targetGroup = ImageDateGroup.earlier;
+      }
+
+      // Jump to corresponding group using the key
+      if (widget.groupedGridViewKey?.currentState != null) {
+        (widget.groupedGridViewKey!.currentState as dynamic)
+            .scrollToGroup(targetGroup);
+      }
+
+      // Show hint message
+      if (context.mounted) {
+        AppToast.info(
+          context,
+          '已跳转到 ${picked.year}-${picked.month.toString().padLeft(2, '0')}',
+        );
+      }
+    }
+  }
+}
+
+

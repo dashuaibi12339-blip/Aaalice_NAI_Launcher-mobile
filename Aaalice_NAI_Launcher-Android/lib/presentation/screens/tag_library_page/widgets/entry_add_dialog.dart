@@ -1,0 +1,697 @@
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:nai_launcher/core/utils/localization_extension.dart';
+import 'package:path/path.dart' as path;
+import 'package:path_provider/path_provider.dart';
+import 'package:uuid/uuid.dart';
+
+import '../../../../data/models/tag_library/tag_library_category.dart';
+import '../../../../data/models/tag_library/tag_library_entry.dart';
+import '../../../providers/image_generation_provider.dart';
+import '../../../providers/tag_library_page_provider.dart';
+import '../../../widgets/autocomplete/autocomplete.dart';
+import '../../../widgets/common/app_toast.dart';
+import '../../../widgets/common/safe_dropdown.dart';
+import '../../../widgets/common/thumbnail_display.dart';
+import '../../../widgets/common/themed_input.dart';
+import '../../../widgets/prompt/nai_syntax_controller.dart';
+import '../../../widgets/prompt/prompt_formatter_wrapper.dart';
+import 'thumbnail_crop_dialog.dart';
+
+/// 添加/编辑词库条目对话框
+class EntryAddDialog extends ConsumerStatefulWidget {
+  final List<TagLibraryCategory> categories;
+  final String? initialCategoryId;
+
+  /// 要编辑的条目，如果为 null 则为新建模式
+  final TagLibraryEntry? entry;
+
+  /// 初始提示词内容（用于从外部传入预选文本）
+  final String? initialContent;
+
+  /// 初始图像字节数据（用于从图像卡片传入预览图）
+  final Uint8List? initialImageBytes;
+
+  /// 初始条目名称（用于从拖拽图片创建时预填文件名）
+  final String? initialName;
+
+  const EntryAddDialog({
+    super.key,
+    required this.categories,
+    this.initialCategoryId,
+    this.entry,
+    this.initialContent,
+    this.initialImageBytes,
+    this.initialName,
+  });
+
+  /// 显示对话框的静态方法
+  static Future<void> show(
+    BuildContext context, {
+    required List<TagLibraryCategory> categories,
+    String? initialCategoryId,
+    String? initialContent,
+    Uint8List? initialImageBytes,
+    String? initialName,
+  }) {
+    return showDialog(
+      context: context,
+      builder: (context) => EntryAddDialog(
+        categories: categories,
+        initialCategoryId: initialCategoryId,
+        initialContent: initialContent,
+        initialImageBytes: initialImageBytes,
+        initialName: initialName,
+      ),
+    );
+  }
+
+  @override
+  ConsumerState<EntryAddDialog> createState() => _EntryAddDialogState();
+}
+
+class _EntryAddDialogState extends ConsumerState<EntryAddDialog> {
+  late final TextEditingController _nameController;
+  late final NaiSyntaxController _contentController;
+  late final TextEditingController _tagsController;
+  final _nameFocusNode = FocusNode();
+  final _contentFocusNode = FocusNode();
+  final _tagsFocusNode = FocusNode();
+
+  String? _selectedCategoryId;
+  String? _thumbnailPath;
+
+  // 预览图显示范围调整参数
+  double _thumbnailOffsetX = 0.0;
+  double _thumbnailOffsetY = 0.0;
+  double _thumbnailScale = 1.0;
+
+  bool get _isEditing => widget.entry != null;
+
+  @override
+  void initState() {
+    super.initState();
+    final entry = widget.entry;
+    // 优先使用 initialContent，然后是 entry?.content，最后为空
+    final initialContent = widget.initialContent ?? entry?.content ?? '';
+    // 优先使用 entry?.name，然后是 initialName，最后为空
+    final initialName = entry?.name ?? widget.initialName ?? '';
+    _nameController = TextEditingController(text: initialName);
+    _contentController = NaiSyntaxController(text: initialContent);
+    _tagsController = TextEditingController(text: entry?.tags.join(', ') ?? '');
+    _selectedCategoryId = entry?.categoryId ?? widget.initialCategoryId;
+    _thumbnailPath = entry?.thumbnail;
+
+    // 如果是编辑模式，加载已保存的显示范围设置
+    if (widget.entry != null) {
+      _thumbnailOffsetX = widget.entry!.thumbnailOffsetX;
+      _thumbnailOffsetY = widget.entry!.thumbnailOffsetY;
+      _thumbnailScale = widget.entry!.thumbnailScale;
+    }
+
+    // 监听内容变化，更新保存按钮状态
+    _contentController.addListener(_onContentChanged);
+
+    // 如果有初始图像字节数据，保存到临时文件
+    if (widget.initialImageBytes != null && widget.entry == null) {
+      _saveImageBytesToTemp(widget.initialImageBytes!);
+    }
+  }
+
+  /// 将图像字节数据保存到临时文件
+  Future<void> _saveImageBytesToTemp(Uint8List bytes) async {
+    try {
+      final tempDir = await getTemporaryDirectory();
+      final fileName = 'temp_${DateTime.now().millisecondsSinceEpoch}.png';
+      final file = File('${tempDir.path}/$fileName');
+      await file.writeAsBytes(bytes);
+      if (mounted) {
+        setState(() {
+          _thumbnailPath = file.path;
+        });
+      }
+    } catch (e) {
+      debugPrint('保存临时图像失败: $e');
+    }
+  }
+
+  void _onContentChanged() {
+    setState(() {
+      // 触发重建以更新保存按钮状态
+    });
+  }
+
+  @override
+  void dispose() {
+    _contentController.removeListener(_onContentChanged);
+    _nameController.dispose();
+    _contentController.dispose();
+    _tagsController.dispose();
+    _nameFocusNode.dispose();
+    _contentFocusNode.dispose();
+    _tagsFocusNode.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Dialog(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: ConstrainedBox(
+        // 【修复 1】：删掉致命的 minWidth: 500，把 maxHeight 改为动态获取屏幕高度防遮挡
+        constraints: BoxConstraints(
+          maxWidth: 700,
+          maxHeight: MediaQuery.of(context).size.height * 0.85,
+        ),
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.all(20), // 稍微缩小内边距
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                // 标题
+                Row(
+                  children: [
+                    Icon(
+                      _isEditing ? Icons.edit_outlined : Icons.add_box_outlined,
+                      color: theme.colorScheme.primary,
+                    ),
+                    const SizedBox(width: 8),
+                    // 【修复 2】：用 Expanded 包裹标题，删掉 Spacer，防止多语言文字过长溢出
+                    Expanded(
+                      child: Text(
+                        _isEditing
+                            ? context.l10n.tagLibrary_editEntry
+                            : context.l10n.tagLibrary_addEntry,
+                        style: theme.textTheme.titleLarge?.copyWith(
+                          fontWeight: FontWeight.w600,
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => Navigator.of(context).pop(),
+                    ),
+                  ],
+                ),
+
+                const SizedBox(height: 16),
+
+                // 主要内容区域
+                // 【修复 3】：把死板的 Row 改成 Column，让图片和表单上下排列，完美适配手机
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // 上方 - 预览图（居中显示）
+                    Center(child: _buildThumbnailSection(theme)),
+                    const SizedBox(height: 16),
+
+                    // 下方 - 表单
+                    _buildFormSection(theme),
+                  ],
+                ),
+
+                const SizedBox(height: 16),
+
+                // 提示词内容
+                Text(
+                  context.l10n.tagLibrary_content,
+                  style: theme.textTheme.labelLarge,
+                ),
+                const SizedBox(height: 8),
+                SizedBox(
+                  height: 120, // 稍微降低高度，给手机弹出的键盘留出空间
+                  child: PromptFormatterWrapper(
+                    controller: _contentController,
+                    focusNode: _contentFocusNode,
+                    enableAutoFormat:
+                        ref.watch(autoFormatPromptSettingsProvider),
+                    child: AutocompleteWrapper.withAlias(
+                      controller: _contentController,
+                      focusNode: _contentFocusNode,
+                      ref: ref,
+                      config: const AutocompleteConfig(
+                        maxSuggestions: 15,
+                        showTranslation: true,
+                        showCategory: true,
+                        autoInsertComma: true,
+                      ),
+                      child: ThemedInput(
+                        controller: _contentController,
+                        decoration: InputDecoration(
+                          hintText: context.l10n.tagLibrary_contentHint,
+                          contentPadding: const EdgeInsets.all(12),
+                        ),
+                        maxLines: null,
+                        expands: true,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Padding(
+                  padding: const EdgeInsets.only(left: 12),
+                  child: Text(
+                    context.l10n.fixedTags_syntaxHelp,
+                    style: TextStyle(
+                      fontSize: 11, // 缩小提示文字
+                      color: theme.colorScheme.outline,
+                    ),
+                    maxLines: 2,
+                  ),
+                ),
+
+                const SizedBox(height: 16),
+
+                // 操作按钮
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.end,
+                  children: [
+                    TextButton(
+                      onPressed: () => Navigator.of(context).pop(),
+                      child: Text(context.l10n.common_cancel),
+                    ),
+                    const SizedBox(width: 8),
+                    FilledButton(
+                      onPressed: _canSave() ? _save : null,
+                      child: Text(context.l10n.common_save),
+                    ),
+                  ],
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+  
+  Widget _buildThumbnailSection(ThemeData theme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          context.l10n.tagLibrary_thumbnail,
+          style: theme.textTheme.labelLarge,
+        ),
+        const SizedBox(height: 8),
+        GestureDetector(
+          onTap: _thumbnailPath != null ? _showThumbnailOptions : _selectThumbnail,
+          child: Container(
+            width: 200,
+            height: 80,
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(12),
+              border: Border.all(
+                color: theme.colorScheme.outlineVariant,
+                style: BorderStyle.solid,
+              ),
+            ),
+            child: _thumbnailPath != null
+                ? Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(11),
+                        child: _buildThumbnailImage(),
+                      ),
+                      Positioned(
+                        top: 4,
+                        right: 4,
+                        child: IconButton.filled(
+                          icon: const Icon(Icons.close, size: 16),
+                          style: IconButton.styleFrom(
+                            backgroundColor: Colors.black54,
+                            foregroundColor: Colors.white,
+                            minimumSize: const Size(24, 24),
+                            padding: EdgeInsets.zero,
+                          ),
+                          onPressed: () {
+                            setState(() => _thumbnailPath = null);
+                          },
+                        ),
+                      ),
+                    ],
+                  )
+                : Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(
+                        Icons.add_photo_alternate_outlined,
+                        size: 36,
+                        color: theme.colorScheme.outline,
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        context.l10n.tagLibrary_selectImage,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: theme.colorScheme.outline,
+                        ),
+                      ),
+                    ],
+                  ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        Text(
+          context.l10n.tagLibrary_thumbnailHint,
+          style: TextStyle(
+            fontSize: 11,
+            color: theme.colorScheme.outline,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildFormSection(ThemeData theme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // 名称
+        Text(
+          context.l10n.tagLibrary_name,
+          style: theme.textTheme.labelLarge,
+        ),
+        const SizedBox(height: 8),
+        ThemedInput(
+          controller: _nameController,
+          focusNode: _nameFocusNode,
+          hintText: context.l10n.tagLibrary_nameHint,
+          textInputAction: TextInputAction.next,
+          onSubmitted: (_) {
+            _contentFocusNode.requestFocus();
+          },
+        ),
+
+        const SizedBox(height: 16),
+
+        // 分类
+        Text(
+          context.l10n.tagLibrary_category,
+          style: theme.textTheme.labelLarge,
+        ),
+        const SizedBox(height: 8),
+        SafeDropdown<String?>(
+          value: _selectedCategoryId,
+          items: [
+            DropdownMenuItem(
+              value: null,
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.folder_outlined,
+                    size: 18,
+                    color: theme.colorScheme.primary,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(context.l10n.tagLibrary_rootCategory),
+                ],
+              ),
+            ),
+            ...widget.categories.map(
+              (category) => DropdownMenuItem(
+                value: category.id,
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.folder,
+                      size: 18,
+                      color: theme.colorScheme.outline,
+                    ),
+                    const SizedBox(width: 8),
+                    Text(category.displayName),
+                  ],
+                ),
+              ),
+            ),
+          ],
+          onChanged: (value) {
+            setState(() => _selectedCategoryId = value);
+          },
+        ),
+
+        const SizedBox(height: 16),
+
+        // 标签
+        Text(
+          context.l10n.tagLibrary_tags,
+          style: theme.textTheme.labelLarge,
+        ),
+        const SizedBox(height: 8),
+        AutocompleteWrapper(
+          controller: _tagsController,
+          focusNode: _tagsFocusNode,
+          asyncStrategy: LocalTagStrategy.create(
+            ref,
+            const AutocompleteConfig(
+              maxSuggestions: 10,
+              showTranslation: true,
+              showCategory: true,
+              autoInsertComma: true,
+            ),
+          ),
+          child: ThemedInput(
+            controller: _tagsController,
+            hintText: context.l10n.tagLibrary_tagsHint,
+            helperText: context.l10n.tagLibrary_tagsHelper,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 构建带变换效果的预览图
+  /// 使用 ThumbnailDisplay 组件确保与 EntryCard 显示一致
+  Widget _buildThumbnailImage() {
+    if (_thumbnailPath == null) {
+      return Container(
+        color: Colors.grey.shade800,
+        child: const Center(
+          child: Icon(Icons.image_not_supported, color: Colors.white38),
+        ),
+      );
+    }
+
+    // 调试用
+    debugPrint('EntryAddDialog: offset=($_thumbnailOffsetX, $_thumbnailOffsetY), scale=$_thumbnailScale');
+    
+    // 使用 ThumbnailDisplay 组件确保与 EntryCard 显示一致
+    return ThumbnailDisplay(
+      imagePath: _thumbnailPath!,
+      offsetX: _thumbnailOffsetX,
+      offsetY: _thumbnailOffsetY,
+      scale: _thumbnailScale,
+      width: 200,
+      height: 80,
+    );
+  }
+
+  /// 显示预览图选项菜单
+  void _showThumbnailOptions() {
+    showModalBottomSheet(
+      context: context,
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.image),
+              title: Text(context.l10n.tagLibrary_selectNewImage),
+              onTap: () {
+                Navigator.pop(context);
+                _selectThumbnail();
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.crop_free),
+              title: Text(context.l10n.tagLibrary_adjustDisplayRange),
+              onTap: () {
+                Navigator.pop(context);
+                _openCropDialog();
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 打开缩略图裁剪调整对话框
+  Future<void> _openCropDialog() async {
+    await showThumbnailCropDialog(
+      context: context,
+      imagePath: _thumbnailPath!,
+      initialOffsetX: _thumbnailOffsetX,
+      initialOffsetY: _thumbnailOffsetY,
+      initialScale: _thumbnailScale,
+      onConfirm: (result) {
+        setState(() {
+          _thumbnailOffsetX = result.offsetX;
+          _thumbnailOffsetY = result.offsetY;
+          _thumbnailScale = result.scale;
+        });
+      },
+    );
+  }
+
+  Future<void> _selectThumbnail() async {
+    final result = await FilePicker.platform.pickFiles(
+      type: FileType.image,
+      allowMultiple: false,
+    );
+
+    if (result != null && result.files.single.path != null) {
+      setState(() {
+        _thumbnailPath = result.files.single.path;
+      });
+    }
+  }
+
+  bool _canSave() {
+    return _contentController.text.trim().isNotEmpty;
+  }
+
+  /// 确保缩略图存储在应用目录内
+  /// 如果缩略图在外部路径，则复制到应用目录并返回新路径
+  Future<String?> _ensureThumbnailInAppDir(String? thumbnailPath) async {
+    if (thumbnailPath == null || thumbnailPath.isEmpty) {
+      return null;
+    }
+
+    // 检查文件是否已存在于应用目录内
+    final appDir = await getApplicationDocumentsDirectory();
+    final thumbnailsDir = Directory(
+      path.join(appDir.path, 'tag_library_thumbnails'),
+    );
+
+    // 如果路径已经在应用目录内，直接返回
+    if (thumbnailPath.startsWith(thumbnailsDir.path)) {
+      return thumbnailPath;
+    }
+
+    // 确保缩略图目录存在
+    if (!await thumbnailsDir.exists()) {
+      await thumbnailsDir.create(recursive: true);
+    }
+
+    // 复制文件到应用目录
+    final sourceFile = File(thumbnailPath);
+    if (!await sourceFile.exists()) {
+      // 原文件不存在，返回 null（图片可能被删除了）
+      return null;
+    }
+
+    final ext = path.extension(thumbnailPath);
+    final newFileName = '${const Uuid().v4()}$ext';
+    final newPath = path.join(thumbnailsDir.path, newFileName);
+
+    await sourceFile.copy(newPath);
+    return newPath;
+  }
+
+  /// 删除应用目录内的旧缩略图文件
+  Future<void> _deleteOldThumbnail(String? oldThumbnailPath) async {
+    if (oldThumbnailPath == null || oldThumbnailPath.isEmpty) {
+      return;
+    }
+
+    try {
+      final appDir = await getApplicationDocumentsDirectory();
+      final thumbnailsDir = path.join(appDir.path, 'tag_library_thumbnails');
+
+      // 只删除应用目录内的文件，避免误删外部文件
+      if (oldThumbnailPath.startsWith(thumbnailsDir)) {
+        final file = File(oldThumbnailPath);
+        if (await file.exists()) {
+          await file.delete();
+        }
+      }
+    } catch (e) {
+      // 忽略删除失败，不影响保存流程
+      debugPrint('删除旧缩略图失败: $e');
+    }
+  }
+
+  Future<void> _save() async {
+    final name = _nameController.text.trim();
+    final content = _contentController.text.trim();
+    final tagsText = _tagsController.text.trim();
+    final tags = tagsText.isNotEmpty
+        ? tagsText
+            .split(',')
+            .map((t) => t.trim())
+            .where((t) => t.isNotEmpty)
+            .toList()
+        : <String>[];
+
+    if (content.isEmpty) return;
+
+    // 获取旧的缩略图路径（用于后续清理）
+    final String? oldThumbnailPath =
+        _isEditing ? widget.entry?.thumbnail : null;
+
+    // 处理缩略图：确保存储在应用目录内
+    final String? savedThumbnailPath =
+        await _ensureThumbnailInAppDir(_thumbnailPath);
+
+    // 如果缩略图发生了变化，删除旧的
+    if (oldThumbnailPath != null &&
+        oldThumbnailPath != savedThumbnailPath &&
+        oldThumbnailPath != _thumbnailPath) {
+      await _deleteOldThumbnail(oldThumbnailPath);
+    }
+
+    final notifier = ref.read(tagLibraryPageNotifierProvider.notifier);
+
+    if (_isEditing) {
+      // 编辑模式：更新现有条目
+      final updatedEntry = widget.entry!.copyWith(
+        name: name,
+        content: content,
+        thumbnail: savedThumbnailPath,
+        thumbnailOffsetX: _thumbnailOffsetX,
+        thumbnailOffsetY: _thumbnailOffsetY,
+        thumbnailScale: _thumbnailScale,
+        tags: tags,
+        categoryId: _selectedCategoryId,
+        updatedAt: DateTime.now(),
+      );
+      notifier.updateEntry(updatedEntry);
+    } else {
+      // 新建模式：添加新条目
+      notifier.addEntry(
+        name: name,
+        content: content,
+        thumbnail: savedThumbnailPath,
+        thumbnailOffsetX: _thumbnailOffsetX,
+        thumbnailOffsetY: _thumbnailOffsetY,
+        thumbnailScale: _thumbnailScale,
+        tags: tags,
+        categoryId: _selectedCategoryId,
+      );
+    }
+
+    if (mounted) {
+      Navigator.of(context).pop();
+      // 显示保存成功提示
+      AppToast.success(
+        context,
+        _isEditing
+            ? context.l10n.tagLibrary_entryUpdated
+            : context.l10n.tagLibrary_entrySaved,
+      );
+    }
+  }
+}

@@ -1,0 +1,119 @@
+name: nai_launcher
+description: NovelAI Universal Launcher - 跨平台第三方客户端
+publish_to: "none"
+version: 1.0.0-beta10+14
+
+environment:
+  sdk: ">=3.2.0 <4.0.0"
+  flutter: ">=3.16.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+
+  flutter_riverpod: ^2.5.1
+  riverpod_annotation: ^2.3.5
+  dio: ^5.4.0
+  dio_http2_adapter: ^2.3.0
+  flutter_cache_manager: ^3.3.0
+  
+  flutter_secure_storage: ^9.2.4
+  hive: ^2.2.3
+  hive_flutter: ^1.1.0
+  shared_preferences: ^2.2.3
+
+  # 👇 【保留手机端专属】手机端必须用 sqflite，绝不能用 PC 的 ffi
+  sqflite: ^2.3.0
+  sqlite3_flutter_libs: ^0.5.28
+
+  cryptography: ^2.7.0
+  crypto: ^3.0.3
+  archive: ^3.6.1
+  msgpack_dart: ^1.0.1
+  image: ^4.1.7
+  super_clipboard: ^0.8.23
+  super_drag_and_drop: ^0.8.23
+  go_router: ^14.2.0
+  flex_color_scheme: ^7.3.1
+  google_fonts: ^6.3.3
+  emoji_picker_flutter: ^2.1.1
+  fl_chart: ^0.68.0
+  visibility_detector: ^0.4.0+2
+  freezed_annotation: ^2.4.1
+  json_annotation: ^4.9.0
+  path_provider: ^2.1.3
+  path: ^1.9.0
+  uuid: ^4.4.0
+  intl: ^0.20.2
+  collection: ^1.18.0
+  synchronized: ^3.1.0
+  csv: ^6.0.0
+  share_plus: ^10.0.0
+  file_picker: ^8.0.0
+  logger: ^2.4.0
+  audioplayers: ^6.0.0
+
+  video_player: ^2.8.0
+  video_player_media_kit: ^1.0.5
+
+  cached_network_image: ^3.4.1
+  url_launcher: ^6.3.1
+  flutter_staggered_grid_view: ^0.7.0
+  permission_handler: ^11.3.1
+  device_info_plus: ^10.1.0
+  timeago: ^3.7.1
+  package_info_plus: ^8.0.0
+  png_chunks_extract: any
+  pub_semver: ^2.1.4
+  
+  # 👇 【保留手机端专属】手机端相册保存插件
+  image_gallery_saver_plus: ^4.0.1
+
+  dart_sentencepiece_tokenizer: ^1.3.0 # Token 计数核心
+  web_socket_channel: ^3.0.3           # ComfyUI 连接核心
+  onnxruntime: ^1.4.1                  # 图像反推 Tagger 核心
+  open_filex: ^4.7.0
+
+dev_dependencies:
+  flutter:
+    sdk: flutter
+  # 👈 【新增这行】原作者新加的桌面数据库支持
+  sqflite_common_ffi: ^2.3.3  
+
+  flutter_launcher_icons: ^0.13.1
+  flutter_lints: ^4.0.0
+  build_runner: ^2.4.9
+  riverpod_generator: ^2.4.0
+  freezed: ^2.5.2
+  json_serializable: ^6.8.0
+  hive_generator: ^2.0.1
+  # 工程师注：已删掉 glados, mocktail 等测试库，解除依赖冲突
+  path_provider_platform_interface: any
+  plugin_platform_interface: any
+  sqlite3: ^2.9.4
+
+flutter:
+  uses-material-design: true
+  generate: true
+  assets:
+    - assets/images/
+    - assets/icons/
+    - assets/translations/
+    - assets/data/
+    - assets/data/wordlists/
+    - assets/data/tokenizers/
+    - assets/sounds/
+    - assets/databases/
+    - assets/database/
+  fonts:
+    - family: LXGW ZhenKai GB
+      fonts:
+        - asset: fonts/LXGWZhenKaiGB-Regular.ttf
+
+# 👇 【保留手机端专属】图标配置
+flutter_icons:
+  android: true
+  ios: false
+  image_path: "assets/app_icon.png"
